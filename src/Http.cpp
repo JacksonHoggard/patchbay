@@ -1,8 +1,11 @@
 #include "Http.h"
 #include "Fs.h"
 
+#include <coreinit/thread.h>
+#include <coreinit/time.h>
 #include <cstdio>
 #include <curl/curl.h>
+#include <mutex>
 #include <vector>
 
 extern const char kCaCertPem[];
@@ -26,12 +29,70 @@ static int abortCheck(void *, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
     return gAbort.load() ? 1 : 0;
 }
 
+// One DNS cache shared by every transfer. The console's resolver is slow
+// and fails intermittently, especially when several threads resolve at once,
+// so asking it as rarely as possible avoids most "Could not resolve host".
+static CURLSH *gShare = nullptr;
+static std::mutex gShareLocks[CURL_LOCK_DATA_LAST];
+
+static void shareLock(CURL *, curl_lock_data data, curl_lock_access, void *) {
+    gShareLocks[data].lock();
+}
+
+static void shareUnlock(CURL *, curl_lock_data data, void *) {
+    gShareLocks[data].unlock();
+}
+
 bool globalInit() {
-    return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return false;
+    gShare = curl_share_init();
+    if (gShare) {
+        curl_share_setopt(gShare, CURLSHOPT_LOCKFUNC, shareLock);
+        curl_share_setopt(gShare, CURLSHOPT_UNLOCKFUNC, shareUnlock);
+        curl_share_setopt(gShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+    }
+    return true;
 }
 
 void globalCleanup() {
+    if (gShare) curl_share_cleanup(gShare);
+    gShare = nullptr;
     curl_global_cleanup();
+}
+
+// Errors worth retrying: DNS hiccups, dropped/reset connections and the
+// Wii U's occasional "Socket operation on non-socket" mid-transfer.
+static bool isTransient(CURLcode rc) {
+    switch (rc) {
+    case CURLE_COULDNT_RESOLVE_HOST:
+    case CURLE_COULDNT_CONNECT:
+    case CURLE_OPERATION_TIMEDOUT:
+    case CURLE_RECV_ERROR:
+    case CURLE_SEND_ERROR:
+    case CURLE_PARTIAL_FILE:
+    case CURLE_GOT_NOTHING:
+    case CURLE_SSL_CONNECT_ERROR:
+    case CURLE_HTTP2:
+    case CURLE_HTTP2_STREAM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool isTransientStatus(long status) {
+    return status == 408 || status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
+}
+
+// Sleeps in short slices so cancel/exit stay responsive. Returns false if
+// the wait was interrupted.
+static bool backoff(int attempt, const std::atomic<bool> *cancel) {
+    int ms = 1000 << (attempt < 4 ? attempt : 4); // 1, 2, 4, 8, 16 s
+    for (int waited = 0; waited < ms; waited += 100) {
+        if (gAbort.load() || (cancel && cancel->load())) return false;
+        OSSleepTicks(OSMillisecondsToTicks(100));
+    }
+    return true;
 }
 
 bool isHttps(const std::string &url) {
@@ -62,6 +123,9 @@ static CURL *makeHandle(const std::string &url) {
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
+    if (gShare) curl_easy_setopt(c, CURLOPT_SHARE, gShare);
+    curl_easy_setopt(c, CURLOPT_DNS_CACHE_TIMEOUT, 3600L);
     curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, abortCheck);
     return c;
@@ -84,17 +148,32 @@ static size_t memWrite(char *ptr, size_t size, size_t nmemb, void *ud) {
     return n;
 }
 
+static Result getOnce(const std::string &url, std::string &body, size_t maxBytes, CURLcode &rc);
+
 Result get(const std::string &url, std::string &body, size_t maxBytes) {
     Result r;
     body.clear();
-    if (gAbort) {
-        r.error = "Aborted";
-        return r;
-    }
     if (!isHttps(url)) {
         r.error = "Only HTTPS URLs are allowed";
         return r;
     }
+    for (int attempt = 0;; ++attempt) {
+        if (gAbort) {
+            r.error = "Aborted";
+            return r;
+        }
+        CURLcode rc = CURLE_OK;
+        r = getOnce(url, body, maxBytes, rc);
+        bool retry = !r.ok && (isTransient(rc) || isTransientStatus(r.status));
+        if (!retry || attempt >= 3) return r;
+        fs::log("GET %s: %s (retry %d)", url.c_str(), r.error.c_str(), attempt + 1);
+        if (!backoff(attempt, nullptr)) return r;
+    }
+}
+
+static Result getOnce(const std::string &url, std::string &body, size_t maxBytes, CURLcode &rc) {
+    Result r;
+    body.clear();
     CURL *c = makeHandle(url);
     if (!c) {
         r.error = "curl_easy_init failed";
@@ -111,7 +190,7 @@ Result get(const std::string &url, std::string &body, size_t maxBytes) {
     char errbuf[CURL_ERROR_SIZE] = {0};
     curl_easy_setopt(c, CURLOPT_ERRORBUFFER, errbuf);
 
-    CURLcode rc = curl_easy_perform(c);
+    rc = curl_easy_perform(c);
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
     curl_easy_cleanup(c);
 
@@ -170,7 +249,17 @@ Result download(const std::string &url, const std::string &path, const Progress 
     int64_t existing = fs::fileSize(path);
     if (existing < 0) existing = 0;
 
-    for (int attempt = 0; attempt < 2; ++attempt) {
+    // Failures in a row without new data. A long download over a flaky
+    // connection keeps going as long as each attempt makes progress.
+    const int kMaxStalls = 6;
+    int stalls = 0;
+    bool restarted = false;
+
+    while (true) {
+        if (gAbort.load()) {
+            r.error = "Aborted";
+            return r;
+        }
         FILE *f = std::fopen(path.c_str(), existing > 0 ? "ab" : "wb");
         if (!f) {
             r.error = "Cannot open " + path + " for writing";
@@ -201,6 +290,7 @@ Result download(const std::string &url, const std::string &path, const Progress 
         if (existing > 0) curl_easy_setopt(c, CURLOPT_RESUME_FROM_LARGE, (curl_off_t) existing);
 
         CURLcode rc = curl_easy_perform(c);
+        r.status = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
         curl_easy_cleanup(c);
         std::fclose(f);
@@ -212,9 +302,10 @@ Result download(const std::string &url, const std::string &path, const Progress 
         // 416: the partial file is already complete (or bigger than the
         // remote). RANGE_ERROR: the server ignored the Range header.
         // Either way restart from scratch once.
-        bool restart = existing > 0 &&
-                       (r.status == 416 || rc == CURLE_RANGE_ERROR || rc == CURLE_BAD_DOWNLOAD_RESUME);
-        if (restart && attempt == 0) {
+        bool rangeProblem = existing > 0 &&
+                            (r.status == 416 || rc == CURLE_RANGE_ERROR || rc == CURLE_BAD_DOWNLOAD_RESUME);
+        if (rangeProblem && !restarted) {
+            restarted = true;
             std::remove(path.c_str());
             existing = 0;
             continue;
@@ -222,17 +313,29 @@ Result download(const std::string &url, const std::string &path, const Progress 
 
         if (sink.writeError) {
             r.error = "SD card write failed (card full?)";
-        } else if (rc != CURLE_OK) {
-            r.error = errbuf[0] ? errbuf : curl_easy_strerror(rc);
-        } else if (r.status < 200 || r.status >= 300) {
-            r.error = "HTTP " + std::to_string(r.status);
-        } else {
-            r.ok = true;
+            return r;
         }
-        return r;
+        if (rc == CURLE_OK && r.status >= 200 && r.status < 300) {
+            r.ok = true;
+            r.error.clear();
+            return r;
+        }
+        r.error = rc != CURLE_OK ? (errbuf[0] ? errbuf : curl_easy_strerror(rc)) : "HTTP " + std::to_string(r.status);
+        if (!(isTransient(rc) || (rc == CURLE_OK && isTransientStatus(r.status)))) return r;
+
+        // Transient: keep what we have and resume.
+        int64_t now = fs::fileSize(path);
+        if (now < 0) now = 0;
+        stalls = now > existing ? 0 : stalls + 1;
+        fs::log("download %s: %s at %lld bytes (stall %d/%d)", url.c_str(), r.error.c_str(), (long long) now, stalls,
+                kMaxStalls);
+        existing = now;
+        if (stalls >= kMaxStalls) return r;
+        if (!backoff(stalls, cancel)) {
+            r.error = (cancel && cancel->load()) ? "Cancelled" : "Aborted";
+            return r;
+        }
     }
-    r.error = "Download failed";
-    return r;
 }
 
 } // namespace http
