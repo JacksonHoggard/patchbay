@@ -3,4 +3,4 @@ build/
 *.rpx
 *.elf
 # Downloaded at configure time (pinned SHA-256 in CMakeLists.txt)
-libs/libarchive-*/
+libs/libarchive-[0-9]*/
