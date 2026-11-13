@@ -263,12 +263,30 @@ def make_splash(path, W, H):
     cv.save(path)
 
 
+def make_store_icon(path, W=256, H=150):
+    """Homebrew App Store icon: the panel centred on a soft glow."""
+    cv = Canvas(W, H, BG)
+    gx, gy, gr = W / 2.0, H / 2.0, H * 0.75
+    for y in range(H):
+        for x in range(W):
+            d = math.hypot(x - gx, y - gy) / gr
+            if d < 1:
+                cv.blend(x, y, (40, 44, 56), (1 - d) ** 2 * 0.6)
+    mw = 168
+    mh = mw * 0.72
+    draw_motif(cv, (W - mw) / 2.0, (H - mh) / 2.0 - 2, mw)
+    cv.save(path)
+
+
 def main():
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "meta")
     root = os.path.normpath(root)
     make_icon(os.path.join(root, "icon.png"))
     make_splash(os.path.join(root, "tv-splash.png"), 1280, 720)
     make_splash(os.path.join(root, "drc-splash.png"), 854, 480)
+    # Homebrew App Store submission images (submit.fortheusers.org).
+    make_store_icon(os.path.join(root, "hbas", "icon.png"))
+    make_splash(os.path.join(root, "hbas", "banner.png"), 848, 208)
     print("wrote", root)
 
 
