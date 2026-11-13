@@ -20,6 +20,63 @@ if(NOT EXISTS "${JSON_HPP}")
         TLS_VERIFY ON)
 endif()
 
+# libarchive (read side only: 7-Zip, RAR, RAR5) - fetched once at configure
+# time, pinned by SHA-256. Only the libarchive/ source folder and the license
+# are kept under libs/. It is compiled here with a hand-written config.h
+# (libs/libarchive-config) instead of libarchive's own CMake, whose platform
+# probes do not fit wut/newlib.
+set(LIBARCHIVE_VERSION 3.8.11)
+set(LIBARCHIVE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libs/libarchive-${LIBARCHIVE_VERSION}")
+if(NOT EXISTS "${LIBARCHIVE_DIR}/libarchive/archive.h")
+    set(LIBARCHIVE_TGZ "${CMAKE_CURRENT_BINARY_DIR}/libarchive-${LIBARCHIVE_VERSION}.tar.gz")
+    message(STATUS "Downloading libarchive ${LIBARCHIVE_VERSION}")
+    file(DOWNLOAD
+        "https://github.com/libarchive/libarchive/releases/download/v${LIBARCHIVE_VERSION}/libarchive-${LIBARCHIVE_VERSION}.tar.gz"
+        "${LIBARCHIVE_TGZ}"
+        EXPECTED_HASH SHA256=900fe9fc7237c2b04f090f3c3648de8fe597525771f5035016537ce2d667d12b
+        TLS_VERIFY ON)
+    file(ARCHIVE_EXTRACT INPUT "${LIBARCHIVE_TGZ}"
+        DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/libs"
+        PATTERNS "libarchive-${LIBARCHIVE_VERSION}/libarchive/*.[ch]"
+                 "libarchive-${LIBARCHIVE_VERSION}/COPYING")
+    file(REMOVE "${LIBARCHIVE_TGZ}")
+endif()
+
+set(LIBARCHIVE_SRC "${LIBARCHIVE_DIR}/libarchive")
+add_library(archive_read STATIC
+    ${LIBARCHIVE_SRC}/archive_acl.c
+    ${LIBARCHIVE_SRC}/archive_blake2s_ref.c
+    ${LIBARCHIVE_SRC}/archive_blake2sp_ref.c
+    ${LIBARCHIVE_SRC}/archive_check_magic.c
+    ${LIBARCHIVE_SRC}/archive_crc32.c
+    ${LIBARCHIVE_SRC}/archive_cryptor.c
+    ${LIBARCHIVE_SRC}/archive_entry.c
+    ${LIBARCHIVE_SRC}/archive_entry_sparse.c
+    ${LIBARCHIVE_SRC}/archive_entry_xattr.c
+    ${LIBARCHIVE_SRC}/archive_hmac.c
+    ${LIBARCHIVE_SRC}/archive_options.c
+    ${LIBARCHIVE_SRC}/archive_ppmd7.c
+    ${LIBARCHIVE_SRC}/archive_rb.c
+    ${LIBARCHIVE_SRC}/archive_read.c
+    ${LIBARCHIVE_SRC}/archive_read_set_options.c
+    ${LIBARCHIVE_SRC}/archive_read_support_format_7zip.c
+    ${LIBARCHIVE_SRC}/archive_read_support_format_rar.c
+    ${LIBARCHIVE_SRC}/archive_read_support_format_rar5.c
+    ${LIBARCHIVE_SRC}/archive_string.c
+    ${LIBARCHIVE_SRC}/archive_string_sprintf.c
+    ${LIBARCHIVE_SRC}/archive_time.c
+    ${LIBARCHIVE_SRC}/archive_util.c
+    ${LIBARCHIVE_SRC}/archive_virtual.c
+)
+target_compile_definitions(archive_read
+    PRIVATE PLATFORM_CONFIG_H="${CMAKE_CURRENT_SOURCE_DIR}/libs/libarchive-config/config.h"
+    PUBLIC LIBARCHIVE_STATIC)
+target_include_directories(archive_read
+    PUBLIC "${LIBARCHIVE_DIR}"
+    PRIVATE "${DEVKITPRO}/portlibs/ppc/include")
+# Third-party code: keep the build output about our own sources.
+target_compile_options(archive_read PRIVATE -w -O2)
+
 # Embed the Mozilla CA bundle so libcurl/mbedTLS can verify HTTPS servers.
 set(CACERT_PEM "${CMAKE_CURRENT_SOURCE_DIR}/data/cacert.pem")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CACERT_PEM}")
@@ -37,9 +94,12 @@ add_executable(patchbay
     src/App.cpp
     src/Config.cpp
     src/Repo.cpp
+    src/GameBanana.cpp
     src/Http.cpp
     src/Fs.cpp
     src/Zip.cpp
+    src/Archive.cpp
+    src/ArchiveLibarchive.cpp
     src/Sha256.cpp
     src/Installer.cpp
     src/Titles.cpp
@@ -63,6 +123,9 @@ pkg_check_modules(CURL_LIBS REQUIRED IMPORTED_TARGET libcurl)
 target_link_libraries(patchbay PRIVATE
     PkgConfig::SDL2_LIBS
     PkgConfig::CURL_LIBS
+    archive_read
+    lzma
+    bz2
     z)
 
 wut_create_rpx(patchbay)

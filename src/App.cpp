@@ -6,6 +6,7 @@
 #include "Titles.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <map>
 
@@ -25,6 +26,34 @@ std::string join(const std::vector<std::string> &v, const std::string &sep) {
     std::string out;
     for (size_t i = 0; i < v.size(); ++i) out += (i ? sep : "") + v[i];
     return out;
+}
+
+// Copy of a game without its mod list, for capturing in callbacks.
+Game gameShell(const Game &g) {
+    Game out;
+    out.name = g.name;
+    out.icon = g.icon;
+    out.titleIds = g.titleIds;
+    out.gbGameId = g.gbGameId;
+    return out;
+}
+
+std::string lower(std::string s) {
+    for (auto &c : s) c = (char) std::tolower((unsigned char) c);
+    return s;
+}
+
+bool endsWith(const std::string &s, const std::string &suffix) {
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// Why gb::FileInfo::supported is false, for the detail page.
+std::string unsupportedReason(const gb::FileInfo &f) {
+    std::string av = lower(f.avResult);
+    if (av == "infected" || av == "suspicious") return "AV: " + f.avResult;
+    std::string n = lower(f.name);
+    if (!endsWith(n, ".zip") && !endsWith(n, ".rar") && !endsWith(n, ".7z")) return "unsupported format";
+    return "archived";
 }
 
 } // namespace
@@ -61,6 +90,7 @@ int App::run() {
     while (running_) {
         pumpEvents();
         pollLoad();
+        pollGb();
         images_->update();
         gfx_.begin();
         draw();
@@ -98,6 +128,8 @@ void App::shutdown() {
     loader_.reset();
     planCancel_ = true;
     planWorker_.reset();
+    gbWorker_.reset();
+    gbDetailWorker_.reset();
     jobs_.reset();
     images_.reset();
     http::globalCleanup();
@@ -128,6 +160,7 @@ void App::startLoad() {
         Config cfg = Config::load();
         std::pair<std::mutex *, std::string *> ud{&loadMutex_, &loadStatus_};
         Catalog cat = repo::loadAll(cfg.repos, loadStatusCb, &ud);
+        if (cfg.gamebanana) gb::mergeInto(cat); // built-in table, no network
         std::lock_guard<std::mutex> lock(loadMutex_);
         loadConfig_ = std::move(cfg);
         loadResult_ = std::move(cat);
@@ -147,7 +180,12 @@ void App::pollLoad() {
     loader_.reset();
     installer_.adoptExisting(catalog_);
     gamesList_ = ListState();
-    screen_ = (config_.repos.empty() || catalog_.games.empty()) ? Screen::Repos : Screen::Games;
+    // Game indexes changed: drop the GameBanana list (the mod cache stays).
+    gbResetList();
+    gbListGameId_ = 0;
+    gbMode_ = false;
+    bool noSources = config_.repos.empty() && !config_.gamebanana;
+    screen_ = (noSources || catalog_.games.empty()) ? Screen::Repos : Screen::Games;
 }
 
 // ---------------------------------------------------------------- input
@@ -333,7 +371,35 @@ const Game *App::currentGame() const {
 }
 
 const Mod *App::currentMod() const {
-    return catalog_.findMod(detailModId_);
+    return findAnyMod(detailModId_);
+}
+
+const Mod *App::findAnyMod(const std::string &id, const Game **game) const {
+    if (game) *game = nullptr;
+    if (const Mod *m = catalog_.findMod(id, game)) return m;
+    auto it = gbMods_.find(id);
+    if (it == gbMods_.end()) return nullptr;
+    if (game) {
+        auto gi = gbModGame_.find(id);
+        if (gi != gbModGame_.end() && gi->second != 0)
+            for (auto &g : catalog_.games)
+                if (g.gbGameId == gi->second) {
+                    *game = &g;
+                    break;
+                }
+    }
+    return &it->second;
+}
+
+int App::gameIndexOf(const Game *g) const {
+    for (size_t i = 0; i < catalog_.games.size(); ++i)
+        if (&catalog_.games[i] == g) return (int) i;
+    return -1;
+}
+
+// gb::modIdFor ids look like "gb<number>-<slug>".
+bool App::isGbModId(const std::string &id) {
+    return id.size() > 2 && id[0] == 'g' && id[1] == 'b' && id[2] >= '0' && id[2] <= '9';
 }
 
 bool App::updateAvailable(const Mod &mod) const {
@@ -440,15 +506,237 @@ void App::toggleEnabled(const std::string &modId) {
 }
 
 void App::openDetail(const std::string &modId) {
+    const Game *g = nullptr;
+    const Mod *m = findAnyMod(modId, &g);
+    int gi = gameIndexOf(g);
+    if (!m || gi < 0) {
+        InstalledMod im;
+        bool fromGb = isGbModId(modId) ||
+                      (installer_.get(modId, im) && lower(im.repoUrl).find("gamebanana") != std::string::npos);
+        if (fromGb) message("GameBanana", "Open the game's GameBanana list to load this mod's page.");
+        return;
+    }
     detailModId_ = modId;
     detailScroll_ = 0;
     detailReturn_ = screen_;
+    gameIndex_ = gi;
+    screen_ = Screen::Detail;
+    if (m->gbModId) gbRequestDetails(m->gbModId);
+}
+
+// GameBanana mods carry no download URL until a file is picked from the
+// details, so every install / update / reinstall goes through here.
+void App::installGbMod(const std::string &modId) {
     const Game *g = nullptr;
-    if (catalog_.findMod(modId, &g) && g) {
-        for (size_t i = 0; i < catalog_.games.size(); ++i)
-            if (&catalog_.games[i] == g) gameIndex_ = (int) i;
-        screen_ = Screen::Detail;
+    const Mod *m = findAnyMod(modId, &g);
+    if (!m || !g || !m->gbModId) return;
+    auto it = gbDetails_.find(m->gbModId);
+    if (it == gbDetails_.end()) {
+        message("GameBanana", "Still loading details");
+        return;
     }
+    if (!it->second.error.empty()) {
+        std::string err = it->second.error;
+        gbRequestDetails(m->gbModId); // retry in the background
+        message("GameBanana", "Could not load this mod's files: " + err + "\n\nTrying again, press A in a moment.");
+        return;
+    }
+    std::vector<gb::FileInfo> files;
+    for (auto &f : it->second.files)
+        if (f.supported) files.push_back(f);
+    if (files.empty()) {
+        message("GameBanana", "No installable file (.zip/.rar/.7z) on this mod");
+        return;
+    }
+
+    const Game gg = gameShell(*g);
+    const Mod mm = *m;
+    auto installFile = [this, gg, mm](const gb::FileInfo &f) {
+        Mod c = mm;
+        gb::applyFile(c, f);
+        requestInstall(gg, c);
+    };
+    auto pickFile = [this, files, installFile] {
+        if (files.size() == 1) {
+            installFile(files[0]);
+            return;
+        }
+        std::vector<std::string> labels;
+        for (auto &f : files) labels.push_back(f.name + (f.size >= 0 ? "  (" + formatSize(f.size) + ")" : ""));
+        choose("Select file", "This mod has several files. Install which one?", labels,
+               [files, installFile](int i) {
+                   if (i < 0 || i >= (int) files.size()) return;
+                   installFile(files[(size_t) i]);
+               });
+    };
+    if (gbNoticeShown_) {
+        pickFile();
+        return;
+    }
+    choose("GameBanana",
+           "GameBanana mods aren't checked for SDCafiine packaging. PatchBay will look for a content/ folder; "
+           "Switch mods and Cemu-only packs will be rejected.",
+           {"Cancel", "Install"}, [this, pickFile](int i) {
+               if (i != 1) return;
+               gbNoticeShown_ = true;
+               pickFile();
+           });
+}
+
+// ---------------------------------------------------------------- GameBanana
+
+void App::gbResetList() {
+    ++gbGen_; // drops any page still in flight
+    gbList_.clear();
+    gbListIds_.clear();
+    gbPage_ = 0;
+    gbTotal_ = 0;
+    gbComplete_ = false;
+    gbWant_ = false;
+    gbError_.clear();
+}
+
+void App::gbOpenList(int gbGameId) {
+    if (gbGameId == gbListGameId_ && (gbPage_ > 0 || gbLoading())) return; // keep the loaded list
+    gbResetList();
+    gbListGameId_ = gbGameId;
+    gbWant_ = gbGameId != 0;
+    modsList_ = ListState();
+}
+
+bool App::gbLoading() const {
+    return gbWant_ || (gbBusy_ && gbInFlightGen_ == gbGen_);
+}
+
+void App::gbMaybeLoadMore() {
+    if (!gbMode_ || gbListGameId_ == 0 || gbComplete_ || gbLoading() || !gbError_.empty() || gbList_.empty()) return;
+    bool onList = screen_ == Screen::Mods || (screen_ == Screen::Detail && detailReturn_ == Screen::Mods);
+    if (onList && modsList_.sel >= (int) gbList_.size() - 5) gbWant_ = true;
+}
+
+void App::gbStartFetch() {
+    gbWant_ = false;
+    const int gid = gbListGameId_, page = gbPage_ + 1;
+    const gb::Sort sort = gbSort_;
+    const uint32_t gen = gbGen_;
+    if (gid == 0) return;
+    gbWorker_.reset(new Worker([this, gid, page, sort, gen] {
+        gb::Page p = gb::fetchMods(gid, page, sort);
+        std::lock_guard<std::mutex> lock(gbMutex_);
+        gbResult_.gen = gen;
+        gbResult_.gameId = gid;
+        gbResult_.page = page;
+        gbResult_.data = std::move(p);
+        gbResultReady_ = true;
+    }));
+    if (!gbWorker_->ok()) {
+        gbWorker_.reset();
+        gbError_ = "Could not start a background thread";
+        return;
+    }
+    gbBusy_ = true;
+    gbInFlightGen_ = gen;
+}
+
+void App::gbRequestDetails(int64_t gbModId) {
+    if (gbModId == 0) return;
+    auto it = gbDetails_.find(gbModId);
+    if (it != gbDetails_.end()) {
+        if (it->second.error.empty()) return;
+        gbDetails_.erase(it); // failed earlier: try again
+    }
+    if (gbDetailBusy_ && gbDetailInFlight_ == gbModId) return;
+    gbDetailWant_ = gbModId;
+}
+
+void App::gbStartDetails() {
+    const int64_t id = gbDetailWant_;
+    gbDetailWant_ = 0;
+    gbDetailWorker_.reset(new Worker([this, id] {
+        gb::Details d = gb::fetchDetails(id);
+        std::lock_guard<std::mutex> lock(gbDetailMutex_);
+        gbDetailResultId_ = id;
+        gbDetailResult_ = std::move(d);
+        gbDetailReady_ = true;
+    }));
+    if (!gbDetailWorker_->ok()) {
+        gbDetailWorker_.reset();
+        gbDetails_[id].error = "Could not start a background thread";
+        return;
+    }
+    gbDetailBusy_ = true;
+    gbDetailInFlight_ = id;
+}
+
+// Called every frame on the UI thread. A worker is only replaced after it
+// posted its result, so reset() joins at once and never blocks on network.
+void App::pollGb() {
+    bool ready = false;
+    GbPageResult r;
+    {
+        std::lock_guard<std::mutex> lock(gbMutex_);
+        if (gbResultReady_) {
+            ready = true;
+            r = std::move(gbResult_);
+            gbResult_ = GbPageResult();
+            gbResultReady_ = false;
+        }
+    }
+    if (ready) {
+        gbWorker_.reset();
+        gbBusy_ = false;
+        if (r.gen == gbGen_) {
+            if (!r.data.error.empty()) {
+                gbError_ = r.data.error;
+            } else {
+                // GameBanana install ids include a slug of the mod name. If
+                // the author renamed the mod, keep using the id it was
+                // installed under so it is not installed twice.
+                std::map<std::string, std::string> installedByGb; // "gb<id>" -> installed id
+                for (const auto &im : installer_.list()) {
+                    if (im.id.rfind("gb", 0) != 0) continue;
+                    size_t dash = im.id.find('-');
+                    installedByGb[im.id.substr(0, dash)] = im.id;
+                }
+                for (auto &m : r.data.mods) {
+                    if (m.id.empty()) continue;
+                    auto inst = installedByGb.find("gb" + std::to_string(m.gbModId));
+                    if (inst != installedByGb.end()) m.id = inst->second;
+                    gbModGame_[m.id] = r.gameId;
+                    gbMods_[m.id] = m;
+                    if (gbListIds_.insert(m.id).second) gbList_.push_back(m.id);
+                }
+                gbPage_ = r.page;
+                gbTotal_ = r.data.total;
+                // A page can be empty after filtering (obsolete/fileless mods)
+                // without being the last one.
+                gbComplete_ = r.data.complete || r.data.rawCount == 0;
+            }
+        }
+    }
+    gbMaybeLoadMore();
+    if (gbWant_ && !gbBusy_) gbStartFetch();
+
+    bool dReady = false;
+    int64_t dId = 0;
+    gb::Details d;
+    {
+        std::lock_guard<std::mutex> lock(gbDetailMutex_);
+        if (gbDetailReady_) {
+            dReady = true;
+            dId = gbDetailResultId_;
+            d = std::move(gbDetailResult_);
+            gbDetailResult_ = gb::Details();
+            gbDetailReady_ = false;
+        }
+    }
+    if (dReady) {
+        gbDetailWorker_.reset();
+        gbDetailBusy_ = false;
+        gbDetailInFlight_ = 0;
+        gbDetails_[dId] = std::move(d);
+    }
+    if (gbDetailWant_ && !gbDetailBusy_) gbStartDetails();
 }
 
 void App::requestExit() {
@@ -482,8 +770,13 @@ void App::handleGames(Btn b) {
     else if (b == Btn::Left) gamesList_.move(-vis, n, vis);
     else if (b == Btn::Right) gamesList_.move(vis, n, vis);
     else if (b == Btn::A && n > 0) {
+        gamesList_.clamp(n, vis);
         gameIndex_ = gamesList_.sel;
         modsList_ = ListState();
+        const Game &g = catalog_.games[(size_t) gameIndex_];
+        // Games with no repo mods open straight into GameBanana.
+        gbMode_ = g.mods.empty() && g.gbGameId != 0;
+        if (gbMode_) gbOpenList(g.gbGameId);
         screen_ = Screen::Mods;
     } else if (b == Btn::Y) {
         startLoad();
@@ -496,14 +789,47 @@ void App::handleMods(Btn b) {
         screen_ = Screen::Games;
         return;
     }
-    int n = (int) g->mods.size();
+    const bool canGb = g->gbGameId != 0;
+    if (!canGb) gbMode_ = false;
+    if (b == Btn::B) {
+        screen_ = Screen::Games;
+        return;
+    }
+    if (b == Btn::Minus && canGb && !g->mods.empty()) {
+        gbMode_ = !gbMode_;
+        modsList_ = ListState();
+        if (gbMode_) gbOpenList(g->gbGameId);
+        return;
+    }
+    if (gbMode_ && (b == Btn::L || b == Btn::R)) {
+        int s = ((int) gbSort_ + (b == Btn::R ? 1 : 2)) % 3;
+        gbSort_ = (gb::Sort) s;
+        gbResetList();
+        gbListGameId_ = g->gbGameId;
+        gbWant_ = true;
+        modsList_ = ListState();
+        return;
+    }
+
+    int n = gbMode_ ? (int) gbList_.size() : (int) g->mods.size();
     int vis = visibleRows(kRowH + 16);
     if (b == Btn::Up) modsList_.move(-1, n, vis);
     else if (b == Btn::Down) modsList_.move(1, n, vis);
     else if (b == Btn::Left) modsList_.move(-vis, n, vis);
     else if (b == Btn::Right) modsList_.move(vis, n, vis);
-    else if (b == Btn::B) screen_ = Screen::Games;
-    else if (n > 0) {
+    else if (gbMode_ && b == Btn::Y && !gbError_.empty() && !gbLoading()) {
+        gbError_.clear(); // retry the failed page
+        gbWant_ = true;
+    } else if (gbMode_ && n > 0) {
+        modsList_.clamp(n, vis);
+        const std::string id = gbList_[(size_t) modsList_.sel];
+        const Mod *m = findAnyMod(id);
+        if (!m) return;
+        // Installing needs a file picked from the details, so Y opens them too.
+        if (b == Btn::A || b == Btn::Y) openDetail(id);
+        else if (b == Btn::X && installer_.isInstalled(id)) requestUninstall(id, m->name);
+    } else if (n > 0) {
+        modsList_.clamp(n, vis);
         const Mod &m = g->mods[(size_t) modsList_.sel];
         if (b == Btn::A) openDetail(m.id);
         else if (b == Btn::Y) {
@@ -516,11 +842,12 @@ void App::handleMods(Btn b) {
 
 void App::handleDetail(Btn b) {
     const Game *g = nullptr;
-    const Mod *m = catalog_.findMod(detailModId_, &g);
+    const Mod *m = findAnyMod(detailModId_, &g);
     if (!m || !g) {
         screen_ = detailReturn_;
         return;
     }
+    const bool isGb = m->gbModId != 0;
     JobQueue::View v;
     bool busy = jobs_->activeFor(m->id, v);
     bool installed = installer_.isInstalled(m->id);
@@ -532,23 +859,40 @@ void App::handleDetail(Btn b) {
     } else if (b == Btn::Down) {
         detailScroll_ = std::min(detailMaxScroll_, detailScroll_ + 1);
     } else if ((b == Btn::L || b == Btn::R) && detailReturn_ == Screen::Mods) {
-        // Step through the game's mods without leaving the page.
+        // Step through the list the page was opened from.
+        std::vector<std::string> ids;
+        if (isGb) ids = gbList_;
+        else
+            for (auto &mod : g->mods) ids.push_back(mod.id);
+        int n = (int) ids.size();
+        if (n == 0) return;
         int idx = 0;
-        for (size_t i = 0; i < g->mods.size(); ++i)
-            if (g->mods[i].id == m->id) idx = (int) i;
-        int n = (int) g->mods.size();
+        for (int i = 0; i < n; ++i)
+            if (ids[(size_t) i] == m->id) idx = i;
         idx = (idx + (b == Btn::R ? 1 : n - 1)) % n;
         modsList_.sel = idx;
         modsList_.clamp(n, visibleRows(kRowH + 16));
-        detailModId_ = g->mods[(size_t) idx].id;
+        detailModId_ = ids[(size_t) idx];
         detailScroll_ = 0;
+        if (isGb)
+            if (const Mod *next = findAnyMod(detailModId_)) gbRequestDetails(next->gbModId);
+    } else if (b == Btn::A && isGb && !busy) {
+        if (installed && !updateAvailable(*m)) {
+            const std::string id = m->id;
+            choose("Reinstall", "Download and reinstall " + m->name + "?", {"Cancel", "Reinstall"},
+                   [this, id](int i) {
+                       if (i == 1) installGbMod(id);
+                   });
+        } else {
+            installGbMod(m->id);
+        }
     } else if (b == Btn::A) {
         if (busy) {
             screen_ = Screen::Queue;
         } else if (!installed || updateAvailable(*m)) {
             requestInstall(*g, *m);
         } else {
-            Game gg{g->name, g->icon, g->titleIds, {}};
+            const Game gg = gameShell(*g);
             const Mod mm = *m;
             choose("Reinstall", "Download and reinstall " + m->name + "?", {"Cancel", "Reinstall"},
                    [this, gg, mm](int i) {
@@ -597,9 +941,10 @@ void App::handleQueue(Btn b) {
             if (v.job->isCombo) {
                 jobs_->enqueueCombo(v.job->mod.id, v.job->gameName, v.job->titleId);
             } else {
-                const Game *g = nullptr;
-                const Mod *m = catalog_.findMod(v.job->mod.id, &g);
-                if (m) jobs_->enqueue(*m, v.job->gameName, v.job->titleId);
+                // Repo mods pick up the current catalog entry; GameBanana mods
+                // reuse the job's copy, which holds the chosen file's URL.
+                const Mod *m = catalog_.findMod(v.job->mod.id);
+                jobs_->enqueue(m ? *m : v.job->mod, v.job->gameName, v.job->titleId);
             }
         }
     }
@@ -722,10 +1067,19 @@ void App::drawGames() {
         gfx_.text(g.name, kMargin + 80, y + 14, FontSize::Normal, onConsole ? color::Text : color::Dim, 700);
 
         int inst = 0;
-        for (auto &im : installed)
+        for (auto &im : installed) {
+            bool counted = false;
             for (auto &m : g.mods)
-                if (m.id == im.id) inst++;
-        std::string right = std::to_string(g.mods.size()) + " mods";
+                if (m.id == im.id) counted = true;
+            if (!counted && g.gbGameId && isGbModId(im.id))
+                for (auto &t : g.titleIds)
+                    if (t == im.titleId) counted = true;
+            if (counted) inst++;
+        }
+        std::string right;
+        if (!g.mods.empty()) right = std::to_string(g.mods.size()) + " mods";
+        if (g.gbGameId) right += (right.empty() ? "" : "  |  ") + std::string("GameBanana");
+        if (right.empty()) right = "0 mods";
         if (inst) right = std::to_string(inst) + " installed  |  " + right;
         gfx_.text(right, Gfx::W - kMargin - 380, y + 16, FontSize::Small, inst ? color::Good : color::Dim, 360, 2);
     }
@@ -734,20 +1088,79 @@ void App::drawGames() {
 void App::drawMods() {
     const Game *g = currentGame();
     if (!g) return;
-    drawFooter("A Details    Y Install/Update    X Uninstall    B Back");
+    const bool canGb = g->gbGameId != 0;
+    const bool both = canGb && !g->mods.empty();
+    const bool gbm = gbMode_ && canGb;
+    const bool loading = gbm && gbLoading();
 
-    gfx_.text(g->name, kMargin, kContentY, FontSize::Large, color::Text, 900);
-    gfx_.text(join(g->titleIds, "  "), kMargin, kContentY + 42, FontSize::Small, color::Dim, 1000);
+    std::string hints;
+    if (gbm) {
+        hints = std::string("A Details    L/R Sort: ") + gb::sortName(gbSort_);
+        if (!gbError_.empty() && !loading) hints += "    Y Retry";
+        hints += "    X Uninstall";
+        if (both) hints += "    - Repos";
+    } else {
+        hints = "A Details    Y Install/Update    X Uninstall";
+        if (both) hints += "    - GameBanana";
+    }
+    drawFooter(hints + "    B Back");
+
+    gfx_.text(g->name, kMargin, kContentY, FontSize::Large, color::Text, 760);
+    gfx_.text(join(g->titleIds, "  "), kMargin, kContentY + 42, FontSize::Small, color::Dim, 640);
+
+    // Source switch, right-aligned: "Repos  |  [GameBanana]".
+    if (both) {
+        const std::string a = gbm ? "Repos" : "[Repos]", sep = "  |  ", c = gbm ? "[GameBanana]" : "GameBanana";
+        int wa = gfx_.textWidth(a, FontSize::Normal), ws = gfx_.textWidth(sep, FontSize::Normal),
+            wc = gfx_.textWidth(c, FontSize::Normal);
+        int x = Gfx::W - kMargin - wa - ws - wc;
+        gfx_.text(a, x, kContentY + 6, FontSize::Normal, gbm ? color::Dim : color::Accent);
+        gfx_.text(sep, x + wa, kContentY + 6, FontSize::Normal, color::Dim);
+        gfx_.text(c, x + wa + ws, kContentY + 6, FontSize::Normal, gbm ? color::Accent : color::Dim);
+    } else if (canGb) {
+        gfx_.text("GameBanana", Gfx::W - kMargin - 300, kContentY + 6, FontSize::Normal, color::Accent, 300, 2);
+    }
+    if (gbm) {
+        std::string info = std::string("Sort: ") + gb::sortName(gbSort_);
+        if (gbTotal_ > 0) info += "  |  " + std::to_string(gbList_.size()) + " of " + std::to_string(gbTotal_);
+        SDL_Color ic = color::Dim;
+        if (!gbList_.empty() && loading) info = "Loading more...  |  " + info;
+        else if (!gbList_.empty() && !gbError_.empty()) {
+            info = "Load failed, Y to retry  |  " + info;
+            ic = color::Bad;
+        }
+        gfx_.text(info, Gfx::W - kMargin - 560, kContentY + 44, FontSize::Small, ic, 560, 2);
+    }
 
     const int top = kContentY + 80;
     const int rowH = kRowH + 16;
     int vis = (kContentH - 80) / rowH;
-    modsList_.clamp((int) g->mods.size(), vis);
+    const int n = gbm ? (int) gbList_.size() : (int) g->mods.size();
+    modsList_.clamp(n, vis);
+
+    if (n == 0) {
+        std::string msg = "No mods for this game.";
+        SDL_Color c = color::Dim;
+        bool retry = false;
+        if (gbm) {
+            if (loading) msg = "Loading...";
+            else if (!gbError_.empty()) {
+                msg = gbError_;
+                c = color::Bad;
+                retry = true;
+            } else msg = "No GameBanana mods for this game.";
+        }
+        gfx_.text(msg, kMargin, 320, FontSize::Large, c, Gfx::W - 2 * kMargin, 1);
+        if (retry) gfx_.text("Y to retry", 0, 370, FontSize::Normal, color::Dim, Gfx::W, 1);
+        return;
+    }
 
     for (int r = 0; r < vis; ++r) {
         int i = modsList_.scroll + r;
-        if (i >= (int) g->mods.size()) break;
-        const Mod &m = g->mods[(size_t) i];
+        if (i >= n) break;
+        const Mod *mp = gbm ? findAnyMod(gbList_[(size_t) i]) : &g->mods[(size_t) i];
+        if (!mp) continue;
+        const Mod &m = *mp;
         int y = top + r * rowH;
         bool sel = i == modsList_.sel;
         gfx_.fill(kMargin, y, Gfx::W - 2 * kMargin, rowH - 8, sel ? color::PanelHi : color::Panel);
@@ -760,8 +1173,13 @@ void App::drawMods() {
         }
         std::string title = m.name + (m.isModpack() ? "  [modpack]" : "");
         gfx_.text(title, tx, y + 8, FontSize::Normal, color::Text, 700);
-        std::string sub = "v" + m.version + "  by " + m.author + "  |  " + formatSize(m.fileSize);
-        if (!m.tags.empty()) sub += "  |  " + join(m.tags, ", ");
+        std::vector<std::string> parts;
+        std::string who = m.version.empty() ? "" : "v" + m.version;
+        if (!m.author.empty()) who += (who.empty() ? "by " : "  by ") + m.author;
+        if (!who.empty()) parts.push_back(who);
+        if (m.fileSize >= 0) parts.push_back(formatSize(m.fileSize));
+        if (!m.tags.empty()) parts.push_back(join(m.tags, ", "));
+        std::string sub = join(parts, "  |  ");
         gfx_.text(sub, tx, y + 42, FontSize::Small, color::Dim, 800);
 
         SDL_Color sc = color::Dim;
@@ -772,8 +1190,19 @@ void App::drawMods() {
 
 void App::drawDetail() {
     const Game *g = nullptr;
-    const Mod *m = catalog_.findMod(detailModId_, &g);
+    const Mod *m = findAnyMod(detailModId_, &g);
     if (!m || !g) return;
+
+    // GameBanana details (description, screenshots, files) load in the
+    // background; until then the list entry's fields are shown.
+    const bool isGb = m->gbModId != 0;
+    const gb::Details *det = nullptr;
+    if (isGb) {
+        auto it = gbDetails_.find(m->gbModId);
+        if (it != gbDetails_.end()) det = &it->second;
+    }
+    const bool detLoading = isGb && !det;
+    const bool detOk = det && det->error.empty();
 
     JobQueue::View v;
     bool busy = jobs_->activeFor(m->id, v);
@@ -795,6 +1224,7 @@ void App::drawDetail() {
     const int mw = 480, mh = 270;
     gfx_.fill(lx, ly, mw, mh, color::Panel);
     std::string shot = m->thumbnail.empty() && !m->screenshots.empty() ? m->screenshots[0] : m->thumbnail;
+    if (shot.empty() && detOk && !det->screenshots.empty()) shot = det->screenshots[0];
     if (SDL_Texture *t = images_->get(shot)) gfx_.image(t, lx, ly, mw, mh);
     else gfx_.text(shot.empty() ? "No preview" : "Loading preview...", lx, ly + mh / 2 - 14, FontSize::Small,
                    color::Dim, mw, 1);
@@ -810,10 +1240,11 @@ void App::drawDetail() {
                                        ? "  (installed " + im.version + ")"
                                        : ""));
     field("Author", m->author);
-    field("Size", formatSize(m->fileSize));
+    field("Size", m->fileSize >= 0 ? formatSize(m->fileSize) : "");
     field("Released", m->releaseDate);
     field("License", m->license);
-    field("Repo", m->repoName);
+    if (isGb) field("Source", "GameBanana");
+    else field("Repo", m->repoName);
     if (installed) field("Installed", im.titleId + (im.enabled ? "" : "  (disabled)"));
 
     if (busy) {
@@ -837,7 +1268,15 @@ void App::drawDetail() {
     auto add = [&](const std::string &text, SDL_Color c) {
         for (auto &l : gfx_.wrap(text, FontSize::Small, rw)) lines.push_back({l, c});
     };
-    add(m->description, color::Text);
+    if (detOk && !det->description.empty()) add(det->description, color::Text);
+    else add(m->description, color::Text);
+    if (detLoading) {
+        lines.push_back({"", color::Text});
+        add("Loading details...", color::Dim);
+    } else if (det && !det->error.empty()) {
+        lines.push_back({"", color::Text});
+        add("Could not load details: " + det->error + " (reopen this page to retry)", color::Bad);
+    }
     if (!m->tags.empty()) {
         lines.push_back({"", color::Text});
         add("Tags: " + join(m->tags, ", "), color::Dim);
@@ -875,6 +1314,21 @@ void App::drawDetail() {
         lines.push_back({"", color::Text});
         add("Changelog", color::Accent);
         add(m->changelog, color::Dim);
+    }
+    if (isGb) {
+        lines.push_back({"", color::Text});
+        add("Source: GameBanana" + (m->profileUrl.empty() ? std::string() : "  " + m->profileUrl), color::Dim);
+        if (detOk) {
+            lines.push_back({"", color::Text});
+            add("Files", color::Accent);
+            if (det->files.empty()) add("No files", color::Dim);
+            for (auto &f : det->files) {
+                std::string l = f.name;
+                if (f.size >= 0) l += "  " + formatSize(f.size);
+                if (!f.supported) l += "  [unsupported: " + unsupportedReason(f) + "]";
+                add(l, f.supported ? color::Text : color::Dim);
+            }
+        }
     }
 
     const int textTop = ly + 90;
@@ -918,10 +1372,11 @@ void App::drawInstalled() {
         std::string sub = im.gameName + "  |  " + im.titleId + "  |  " +
                           (im.version.empty() ? std::string("version unknown") : "v" + im.version);
         auto inCombos = installer_.combosContaining(im.id);
+        if (isGbModId(im.id) || gbMods_.count(im.id)) sub += "  |  GameBanana";
         if (!inCombos.empty()) sub += " | in " + join(inCombos, ", ");
         gfx_.text(sub, kMargin + 20, y + 36, FontSize::Small, color::Dim, 760);
 
-        const Mod *m = catalog_.findMod(im.id);
+        const Mod *m = findAnyMod(im.id);
         SDL_Color c = im.enabled ? color::Good : color::Dim;
         std::string st = im.enabled ? "Enabled" : "Disabled";
         if (m && updateAvailable(*m)) {
@@ -981,9 +1436,18 @@ void App::drawRepos() {
         gfx_.text(config_.error, kMargin, y, FontSize::Normal, color::Bad);
         y += 40;
     }
+    if (config_.gamebanana)
+        gfx_.text("GameBanana: enabled (" + std::to_string(gb::wiiuGames().size()) + " Wii U games)", kMargin, y,
+                  FontSize::Normal, color::Good, Gfx::W - 2 * kMargin);
+    else
+        gfx_.text("GameBanana: disabled (set \"gamebanana\": true in config.json)", kMargin, y, FontSize::Normal,
+                  color::Dim, Gfx::W - 2 * kMargin);
+    y += 40;
+
     if (config_.repos.empty()) {
         std::vector<std::string> help = {
-            "No repositories configured.",
+            config_.gamebanana ? "No repositories configured. GameBanana mods are on the Games tab."
+                               : "No repositories configured.",
             "",
             "Edit SD:/wiiu/apps/patchbay/config.json on your SD card:",
             "",
@@ -1036,16 +1500,26 @@ void App::drawModal() {
     gfx_.fill(0, 0, Gfx::W, Gfx::H, SDL_Color{0, 0, 0, 170});
     const int w = 720;
     const int lh = gfx_.lineHeight(FontSize::Normal);
-    int optH = modal_.options.empty() ? 60 : (int) modal_.options.size() * 52;
-    int h = 90 + (int) modal_.body.size() * lh + optH + 30;
+    // Long option lists (e.g. many files on a GameBanana mod) scroll inside
+    // a window that keeps the selection visible.
+    const int n = (int) modal_.options.size();
+    const int maxBody = 8;
+    int bodyLines = std::min((int) modal_.body.size(), maxBody);
+    int maxVisible = std::max(3, (Gfx::H - 160 - bodyLines * lh) / 52);
+    int visible = std::min(n, maxVisible);
+    int first = std::max(0, std::min(modal_.sel - visible / 2, n - visible));
+    int optH = modal_.options.empty() ? 60 : visible * 52;
+    int h = 90 + bodyLines * lh + optH + 30;
     int x = (Gfx::W - w) / 2, y = (Gfx::H - h) / 2;
     gfx_.fill(x, y, w, h, color::Panel);
     gfx_.outline(x, y, w, h, color::Accent, 2);
     gfx_.text(modal_.title, x + 40, y + 24, FontSize::Large, color::Accent, w - 80);
 
     int ty = y + 80;
-    for (auto &l : modal_.body) {
-        gfx_.text(l, x + 40, ty, FontSize::Normal, color::Text);
+    for (int i = 0; i < bodyLines; ++i) {
+        bool cut = i == maxBody - 1 && (int) modal_.body.size() > maxBody;
+        gfx_.text(cut ? modal_.body[(size_t) i] + " ..." : modal_.body[(size_t) i], x + 40, ty, FontSize::Normal,
+                  color::Text, w - 80);
         ty += lh;
     }
     ty += 16;
@@ -1054,13 +1528,17 @@ void App::drawModal() {
         gfx_.text("OK", x + w / 2 - 80, ty + 8, FontSize::Normal, color::Accent, 160, 1);
         return;
     }
-    for (size_t i = 0; i < modal_.options.size(); ++i) {
-        bool sel = (int) i == modal_.sel;
+    for (int i = first; i < first + visible; ++i) {
+        bool sel = i == modal_.sel;
         gfx_.fill(x + 40, ty, w - 80, 44, sel ? color::PanelHi : color::Bg);
         if (sel) gfx_.fill(x + 40, ty, 5, 44, color::Accent);
-        gfx_.text(modal_.options[i], x + 60, ty + 8, FontSize::Normal, sel ? color::Text : color::Dim, w - 120);
+        gfx_.text(modal_.options[(size_t) i], x + 60, ty + 8, FontSize::Normal, sel ? color::Text : color::Dim,
+                  w - 120);
         ty += 52;
     }
+    // Scroll hints.
+    if (first > 0) gfx_.text("^", x + w - 30, y + 80 + bodyLines * lh + 16, FontSize::Small, color::Dim);
+    if (first + visible < n) gfx_.text("v", x + w - 30, ty - 30, FontSize::Small, color::Dim);
 }
 
 // ---------------------------------------------------------------- combos

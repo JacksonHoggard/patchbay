@@ -17,7 +17,8 @@ jobs:
         run: |
           dkp-pacman -Syu --noconfirm --needed \
             wut wiiu-cmake wiiu-pkg-config \
-            wiiu-sdl2 wiiu-sdl2_ttf wiiu-sdl2_image wiiu-curl wiiu-mbedtls ppc-zlib
+            wiiu-sdl2 wiiu-sdl2_ttf wiiu-sdl2_image wiiu-curl wiiu-mbedtls ppc-zlib \
+            ppc-liblzma ppc-bzip2
 
       - name: Configure
         run: /opt/devkitpro/portlibs/wiiu/bin/powerpc-eabi-cmake -B build -S .

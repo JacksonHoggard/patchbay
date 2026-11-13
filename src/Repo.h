@@ -40,6 +40,12 @@ struct Mod {
     std::string repoName;
     std::string repoUrl;
 
+    // GameBanana-sourced mods.
+    std::string source = "repo"; // "repo" or "gamebanana"
+    int64_t gbModId = 0;
+    std::string md5;        // lowercase hex, verified after download when sha256 is empty
+    std::string profileUrl; // web page (GameBanana)
+
     bool isModpack() const { return type == "modpack"; }
 };
 
@@ -48,6 +54,7 @@ struct Game {
     std::string icon;
     std::vector<std::string> titleIds; // upper-case 16-digit hex
     std::vector<Mod> mods;
+    int gbGameId = 0; // GameBanana game id, 0 if unknown
 };
 
 struct RepoInfo {

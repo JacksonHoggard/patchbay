@@ -1,7 +1,7 @@
 #include "Installer.h"
+#include "Archive.h"
 #include "Fs.h"
 #include "Paths.h"
-#include "Zip.h"
 
 #include <algorithm>
 #include <cctype>
@@ -238,30 +238,148 @@ std::vector<InstalledMod> Installer::enabledForTitle(const std::string &titleId,
     return out;
 }
 
-// Many mod ZIPs wrap everything in one extra folder ("MyMod/content/...").
-// Flatten that so the result is "<modId>/content/...".
-static void unwrapSingleFolder(const std::string &dir) {
-    auto entries = fs::listDir(dir);
-    if (entries.size() != 1 || !entries[0].isDir) return;
-    std::string name = entries[0].name;
-    std::string lower;
-    for (char c : name) lower += (char) std::tolower((unsigned char) c);
-    if (lower == "content" || lower == "aoc" || lower == "code" || lower == "meta") return;
-
-    std::string tmp = dir + "/.patchbay-wrap";
-    if (!fs::rename(dir + "/" + name, tmp)) return;
-    for (const auto &e : fs::listDir(tmp)) fs::rename(tmp + "/" + e.name, dir + "/" + e.name);
-    fs::removeAll(tmp);
+static std::string lowerName(const std::string &s) {
+    std::string out;
+    for (char c : s) out += (char) std::tolower((unsigned char) c);
+    return out;
 }
 
-static bool hasSdCafiineLayout(const std::string &dir) {
+static bool containsModRoot(const std::string &dir) {
     for (const auto &e : fs::listDir(dir)) {
         if (!e.isDir) continue;
-        std::string lower;
-        for (char c : e.name) lower += (char) std::tolower((unsigned char) c);
+        std::string lower = lowerName(e.name);
         if (lower == "content" || lower == "aoc") return true;
     }
     return false;
+}
+
+// Mods are packaged in all sorts of ways ("MyMod/content/...",
+// "MyMod v2/Wii U/content/...", plus readmes and screenshots). Finds the
+// shallowest folder that directly holds content/ or aoc/ and makes it the
+// mod root, dropping everything outside it. Fails with a helpful message for
+// variant packs and for archives that are not SDCafiine mods.
+static bool normalizeLayout(const std::string &staging, std::string &error) {
+    constexpr int kMaxDepth = 4;
+    fs::removeAll(staging + "/__MACOSX");
+
+    std::vector<std::string> level{""}; // paths relative to staging
+    std::vector<std::string> found;
+    for (int depth = 0; depth <= kMaxDepth && found.empty() && !level.empty(); depth++) {
+        std::vector<std::string> next;
+        for (const auto &rel : level) {
+            std::string abs = rel.empty() ? staging : staging + "/" + rel;
+            if (containsModRoot(abs)) {
+                found.push_back(rel);
+                continue;
+            }
+            for (const auto &e : fs::listDir(abs))
+                if (e.isDir) next.push_back(rel.empty() ? e.name : rel + "/" + e.name);
+        }
+        level.swap(next);
+    }
+
+    if (found.size() > 1) {
+        // Name each variant by the first folder where the paths differ
+        // ("Pack/Option A/Wii U" and "Pack/Option B/Wii U" -> "Option A").
+        auto split = [](const std::string &p) {
+            std::vector<std::string> parts;
+            size_t i = 0;
+            while (i <= p.size()) {
+                size_t j = p.find('/', i);
+                if (j == std::string::npos) j = p.size();
+                parts.push_back(p.substr(i, j - i));
+                i = j + 1;
+            }
+            return parts;
+        };
+        std::vector<std::vector<std::string>> paths;
+        for (const auto &f : found) paths.push_back(split(f));
+        size_t common = 0;
+        while (true) {
+            bool same = true;
+            for (const auto &p : paths)
+                if (common + 1 >= p.size() || p[common] != paths[0][common]) same = false;
+            if (!same) break;
+            common++;
+        }
+        std::string names;
+        for (size_t i = 0; i < paths.size() && i < 4; i++) {
+            if (i) names += ", ";
+            names += paths[i][std::min(common, paths[i].size() - 1)];
+        }
+        if (found.size() > 4) names += ", ...";
+        error = "Archive contains several variants (" + names +
+                "); install one manually or ask the repo maintainer to package it";
+        return false;
+    }
+
+    if (found.empty()) {
+        // Look a little deeper to explain what the archive is instead.
+        bool switchMod = false, graphicPack = false;
+        std::vector<std::string> dirs{staging};
+        for (int depth = 0; depth <= kMaxDepth + 2 && !dirs.empty(); depth++) {
+            std::vector<std::string> next;
+            for (const auto &d : dirs) {
+                for (const auto &e : fs::listDir(d)) {
+                    std::string lower = lowerName(e.name);
+                    if (e.isDir && (lower == "romfs" || lower == "exefs")) switchMod = true;
+                    if (!e.isDir && lower == "rules.txt") graphicPack = true;
+                    if (e.isDir) next.push_back(d + "/" + e.name);
+                }
+            }
+            dirs.swap(next);
+        }
+        if (switchMod)
+            error = "This is a Nintendo Switch mod, not a Wii U mod";
+        else if (graphicPack)
+            error = "This is a Cemu graphic pack without game files";
+        else
+            error = "Archive has no content/ or aoc/ folder (not an SDCafiine mod)";
+        return false;
+    }
+
+    const std::string &root = found[0];
+    if (root.empty()) return true;
+
+    // Move the mod root out of the way first so a child named like a
+    // top-level entry ("MyMod/MyMod/...") cannot collide.
+    std::string tmp = staging + "/.patchbay-wrap";
+    fs::removeAll(tmp);
+    if (!fs::rename(staging + "/" + root, tmp)) {
+        error = "Cannot reorganize extracted files";
+        return false;
+    }
+    // SDCafiine also uses code/ and meta/. If the archive keeps them in an
+    // ancestor folder ("Mod/meta" beside "Mod/Wii U/content"), carry them
+    // into the mod root instead of deleting them.
+    {
+        std::vector<std::string> ancestors{staging};
+        size_t pos = 0;
+        while ((pos = root.find('/', pos)) != std::string::npos) {
+            ancestors.push_back(staging + "/" + root.substr(0, pos));
+            pos++;
+        }
+        for (const auto &anc : ancestors) {
+            for (const auto &e : fs::listDir(anc)) {
+                std::string ln = lowerName(e.name);
+                if (!e.isDir || (ln != "code" && ln != "meta")) continue;
+                bool present = false;
+                for (const auto &t : fs::listDir(tmp))
+                    if (lowerName(t.name) == ln) present = true;
+                if (!present) fs::rename(anc + "/" + e.name, tmp + "/" + e.name);
+            }
+        }
+    }
+    for (const auto &e : fs::listDir(staging))
+        if (e.name != ".patchbay-wrap") fs::removeAll(staging + "/" + e.name);
+    for (const auto &e : fs::listDir(tmp)) {
+        if (!fs::rename(tmp + "/" + e.name, staging + "/" + e.name)) {
+            error = "Cannot reorganize extracted files";
+            return false;
+        }
+    }
+    fs::removeAll(tmp);
+    return true;
 }
 
 bool Installer::install(const Mod &mod, const std::string &gameName, const std::string &titleId,
@@ -278,14 +396,12 @@ bool Installer::install(const Mod &mod, const std::string &gameName, const std::
         return false;
     }
 
-    if (!zip::extract(zipPath, staging, zipSize, progress, cancel, error)) {
+    if (!archive::extract(zipPath, staging, zipSize, progress, cancel, error)) {
         fs::removeAll(staging);
         return false;
     }
-    unwrapSingleFolder(staging);
-    if (!hasSdCafiineLayout(staging)) {
+    if (!normalizeLayout(staging, error)) {
         fs::removeAll(staging);
-        error = "Archive has no content/ or aoc/ folder (not an SDCafiine mod)";
         return false;
     }
 

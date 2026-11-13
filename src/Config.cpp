@@ -12,6 +12,9 @@ static bool parseConfig(const std::string &text, Config &cfg) {
         cfg.error = "config.json is not valid JSON";
         return false;
     }
+    auto gb = j.find("gamebanana");
+    if (gb != j.end() && gb->is_boolean()) cfg.gamebanana = gb->get<bool>();
+
     auto it = j.find("repos");
     if (it == j.end() || !it->is_array()) {
         cfg.error = "config.json has no \"repos\" array";
@@ -46,7 +49,7 @@ Config Config::load() {
     }
 
     // First run: write an empty template the user can fill in.
-    json tmpl = {{"repos", json::array()}};
+    json tmpl = {{"repos", json::array()}, {"gamebanana", true}};
     fs::writeFileAtomic(paths::kConfigFile, tmpl.dump(2) + "\n");
     cfg.source = paths::kConfigFile;
     return cfg;

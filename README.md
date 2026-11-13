@@ -158,11 +158,15 @@ example-mod.zip
   CREDITS.txt     other files and folders are fine and get copied as is
 ```
 
-If the archive has a single top-level folder (for example
-`ExampleMod/content/...`), that folder is flattened automatically. After that,
-the archive must contain a `content/` or `aoc/` folder at its top level or the
-install is rejected. Entries with absolute paths, drive letters or `..` are
-rejected.
+ZIP, 7-Zip and RAR (v4 and v5) archives are accepted; the format is detected
+from the file contents, not its name. The mod root is the shallowest folder
+(up to 4 levels deep, for example `ExampleMod/Wii U/content/...`) that
+directly contains `content/` or `aoc/`; it becomes the top level and
+anything outside it is dropped. Archives with several such folders at the
+same depth (variant packs such as `Option A/content` and `Option B/content`),
+Switch mods (`romfs/`, `exefs/`), Cemu graphic packs without game files and
+archives without `content/` or `aoc/` are rejected. Entries with absolute
+paths, drive letters or `..`, and links or devices, are rejected.
 
 ## Files on the SD card
 
@@ -307,7 +311,9 @@ Notes:
 - ZIP support covers stored and deflated entries only. Stored (uncompressed)
   entries that use a data descriptor are not supported; re-create the archive
   with compression or without streaming mode.
-- Encrypted (password-protected) ZIPs are not supported.
+- Encrypted (password-protected) archives are not supported.
+- 7-Zip and RAR archives must be under 2 GiB (ZIPs are streamed and have no
+  such limit). Multi-volume (split) archives are not supported.
 - The SD card is FAT32, so no single file (including the downloaded ZIP) can be
   4 GiB or larger.
 - SDCafiine loads one modpack at a time per game. To use several mods
@@ -325,7 +331,7 @@ devkitPro with the Wii U toolchain. On Windows, install it through MSYS2 so it
 lives in `C:\msys64\opt\devkitpro`. The following packages are needed:
 
 ```
-wut wiiu-sdl2 wiiu-sdl2_ttf wiiu-sdl2_image wiiu-curl wiiu-mbedtls ppc-zlib
+wut wiiu-sdl2 wiiu-sdl2_ttf wiiu-sdl2_image wiiu-curl wiiu-mbedtls ppc-zlib ppc-liblzma ppc-bzip2
 wiiu-pkg-config wiiu-cmake
 ```
 
@@ -333,7 +339,7 @@ Install them from an MSYS2 shell with:
 
 ```sh
 pacman -S --needed wut wiiu-sdl2 wiiu-sdl2_ttf wiiu-sdl2_image wiiu-curl \
-    wiiu-mbedtls ppc-zlib wiiu-pkg-config wiiu-cmake
+    wiiu-mbedtls ppc-zlib ppc-liblzma ppc-bzip2 wiiu-pkg-config wiiu-cmake
 ```
 
 (on Linux/macOS use `dkp-pacman` instead of `pacman`).

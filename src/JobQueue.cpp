@@ -164,6 +164,8 @@ void JobQueue::process(const std::shared_ptr<Job> &job) {
         return;
     }
 
+    if (m.download.empty()) return fail("No downloadable file selected");
+
     std::string zipPath = paths::downloadFile(m.id);
 
     // 1. Download (skipped if a complete file from an earlier attempt exists).
@@ -194,6 +196,14 @@ void JobQueue::process(const std::shared_ptr<Job> &job) {
         if (got != m.sha256) {
             fs::removeAll(zipPath);
             return fail(got.empty() ? "Could not read download" : "SHA-256 mismatch: download rejected");
+        }
+    } else if (!m.md5.empty()) {
+        setState(j, JobState::Verifying);
+        std::string got = md5::ofFile(zipPath, [&](int64_t d, int64_t t) { setProgress(j, d, t); }, &j.cancel);
+        if (j.cancel) return fail("Cancelled");
+        if (got != m.md5) {
+            fs::removeAll(zipPath);
+            return fail(got.empty() ? "Could not read download" : "MD5 mismatch: download rejected");
         }
     }
 
