@@ -148,22 +148,36 @@ def draw_motif(cv, x, y, w):
             cv.circle(jx, jy, jr * 0.78, shade(JACK_RING, 0.7))
             cv.circle(jx, jy, jr * 0.48, JACK_HOLE)
 
-    def cable(a, b, sag, color):
-        (ax, ay), (bx, by) = a, b
-        pts = bezier((ax, ay), (ax, ay + sag * s), (bx, by + sag * s), (bx, by))
-        cr = 3.4 * s
+    # Two cables that never cross: amber links the outer top jacks and hangs
+    # in the gap between the rows; teal links the outer bottom jacks and
+    # hangs below the bottom row. The middle jacks stay free.
+    # A bezier with both control points `sag` below its ends dips 0.75*sag.
+    cables = [
+        ((cols[0], rows[0]), (cols[2], rows[0]), 18.7, AMBER),  # lowest point y=36: centre of the gap
+        ((cols[0], rows[1]), (cols[2], rows[1]), 18.0, TEAL),   # lowest point y=63.5: clears the jacks
+    ]
+    cr = 3.4 * s
+    paths = []
+    for (ax, ay), (bx, by), sag, color in cables:
+        pts = bezier((ax, ay), (ax, ay + sag * s), (bx, by + sag * s), (bx, by), n=64)
+        paths.append((pts, color))
+
+    # Draw each layer for every cable before the next layer, so no cable's
+    # shadow or outline lands on top of another cable or plug.
+    for pts, _ in paths:
         cv.stroke([(px + 1.2 * s, py + 2.4 * s) for px, py in pts], cr + 0.6 * s, (4, 5, 8), 0.45)
+    for pts, color in paths:
         cv.stroke(pts, cr + 1.0 * s, shade(color, 0.45))
         cv.stroke(pts, cr, color)
-        cv.stroke([(px - 0.9 * s, py - 0.9 * s) for px, py in pts[4:-4]], cr * 0.28,
+        cv.stroke([(px - 0.9 * s, py - 0.9 * s) for px, py in pts[6:-6]], cr * 0.28,
                   tuple(min(255, int(v + (255 - v) * 0.55)) for v in color), 0.7)
-        for px, py in (a, b):  # plug heads
+    for (a, b, _, color) in cables:  # plug heads sit on top of everything
+        for px, py in (a, b):
+            cv.circle(px + 0.8 * s, py + 1.4 * s, 6.2 * s, (4, 5, 8), 0.4)
             cv.circle(px, py, 6.2 * s, shade(color, 0.45))
             cv.circle(px, py, 5.2 * s, color)
+            cv.circle(px, py, 2.4 * s, shade(color, 0.7))
             cv.circle(px - 1.3 * s, py - 1.3 * s, 1.6 * s, (255, 255, 255), 0.45)
-
-    cable((cols[2], rows[0]), (cols[0], rows[1]), 22, TEAL)
-    cable((cols[0], rows[0]), (cols[1], rows[1]), 16, AMBER)
     return h
 
 
