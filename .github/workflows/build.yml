@@ -1,0 +1,35 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitppc:latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Wii U portlibs
+        run: |
+          dkp-pacman -Syu --noconfirm --needed \
+            wut wiiu-cmake wiiu-pkg-config \
+            wiiu-sdl2 wiiu-sdl2_ttf wiiu-sdl2_image wiiu-curl wiiu-mbedtls ppc-zlib
+
+      - name: Configure
+        run: /opt/devkitpro/portlibs/wiiu/bin/powerpc-eabi-cmake -B build -S .
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: patchbay
+          path: |
+            build/*.wuhb
+            build/*.rpx
+          if-no-files-found: error
