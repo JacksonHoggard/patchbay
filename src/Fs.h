@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -13,6 +15,18 @@ struct Entry {
 
 // Lists a directory (without "." and ".."). Empty if it does not exist.
 std::vector<Entry> listDir(const std::string &path);
+
+struct FileInfo {
+    std::string rel; // path relative to the walked root, '/'-separated
+    int64_t size;
+};
+
+// Recursively lists every regular file under `root`.
+std::vector<FileInfo> walkFiles(const std::string &root);
+
+// Copies one file. `onBytes` is called with the number of bytes just written.
+bool copyFile(const std::string &from, const std::string &to, const std::function<void(int64_t)> &onBytes,
+              const std::atomic<bool> *cancel);
 
 bool exists(const std::string &path);
 bool isDir(const std::string &path);

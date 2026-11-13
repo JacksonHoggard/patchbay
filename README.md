@@ -171,7 +171,8 @@ rejected.
 | `SD:/wiiu/apps/patchbay/patchbay.wuhb` | The app. |
 | `SD:/wiiu/apps/patchbay/config.json` | Repository list. |
 | `SD:/wiiu/sdcafiine/<TITLEID>/<modId>/` | Installed, enabled mods. This is where SDCafiine looks. |
-| `SD:/wiiu/apps/patchbay/disabled/<TITLEID>/<modId>/` | Disabled mods. SDCafiine does not scan this folder. |
+| `SD:/wiiu/sdcafiine/<TITLEID>/PatchBayCombo-N/` | Enabled combos (merged copies of several mods, see Combining mods). |
+| `SD:/wiiu/apps/patchbay/disabled/<TITLEID>/<modId>/` | Disabled mods and combos. SDCafiine does not scan this folder. |
 | `SD:/wiiu/apps/patchbay/installed.json` | Record of mods PatchBay manages. |
 | `SD:/wiiu/apps/patchbay/tmp/<modId>.zip.part` | Downloads in progress. |
 | `SD:/wiiu/apps/patchbay/patchbay.log` | Log file (appended to on every run). |
@@ -185,8 +186,10 @@ Install details:
   folders are deleted and an interrupted swap is rolled back on the next launch.
 - Disabling a mod moves its folder to the `disabled/` tree; enabling moves it
   back. Uninstalling deletes the folder.
+- Updating or reinstalling a disabled mod keeps it disabled.
 - `installed.json` stores, per mod id: `titleId`, `game`, `name`, `version`,
-  `repo`, `sha256`, `enabled`, `installedAt`. If the file is unreadable it is
+  `repo`, `sha256`, `enabled`, `installedAt`, plus combo definitions under
+  `combos` (see Combining mods). If the file is unreadable it is
   renamed to `installed.json.bad` and PatchBay starts with an empty record. If a
   recorded mod's folder has been deleted by hand, the record is dropped.
 
@@ -215,6 +218,34 @@ Adopted mods have no recorded version ("version unknown"), so PatchBay cannot
 tell whether they are out of date and will not offer an update. Use Reinstall
 on the mod's detail page to replace one with the current version. Folders whose
 name is not a mod id in a configured repo are left alone and not shown.
+
+## Combining mods (combos)
+
+SDCafiine loads one modpack folder per game. A combo merges several installed
+mods for the same title into a single folder,
+`SD:/wiiu/sdcafiine/<TITLEID>/PatchBayCombo-N/`, so they can be used together.
+
+- Files are copied, because FAT32 has no links. A combo needs extra SD space
+  equal to its merged size. The member mods stay installed and are not
+  modified.
+- Members are ordered by priority. When two members ship the same file (same
+  path, compared case-insensitively), the higher one wins. The conflict count
+  and sample paths are shown before building and written to
+  `PATCHBAY_COMBO.txt` in the combo folder, together with the priority order.
+- Only `content/` and `aoc/` are merged. Other top-level files and folders
+  (credits, readmes) are kept per mod under `_credits/<modId>/`.
+- Building a combo disables its enabled members so SDCafiine does not offer
+  them separately. Enabling a combo disables its members again. Disabling a
+  combo moves it to the `disabled/` tree and leaves members as they are.
+- Deleting a combo re-enables the members that were enabled before the combo
+  disabled them, unless another enabled combo still includes them.
+- A combo shows "Needs rebuild" when a member is updated or uninstalled, or the
+  member list was changed. Rebuild it from the combo editor. Members that are
+  no longer installed are dropped on rebuild.
+- Builds run in the Downloads queue and can be cancelled. A build is copied
+  into a staging folder and swapped in at the end, so a failed or cancelled
+  build leaves the previous combo folder intact.
+- Combos are stored in `installed.json` under `combos`.
 
 ## Region selection
 
@@ -246,7 +277,8 @@ On every screen, + exits to the Wii U Menu (with a confirmation if downloads
 are running; unfinished downloads resume when queued again). In dialogs, use
 Up/Down to choose, A to confirm and B to cancel.
 
-L/R switch between the four tabs: Games, Installed, Downloads and Repos.
+L/R switch between the five tabs: Games, Installed, Combos, Downloads and
+Repos.
 
 | Screen | Buttons |
 | --- | --- |
@@ -254,6 +286,8 @@ L/R switch between the four tabs: Games, Installed, Downloads and Repos.
 | Game (mod list) | Up/Down select, Left/Right page, A details, Y install or update, X uninstall, B back |
 | Mod details | A install / update / reinstall (or view downloads while busy), X uninstall (or cancel the running download), Y enable/disable, Up/Down scroll, L/R previous/next mod (when opened from a game's mod list), B back |
 | Installed | Up/Down select, Left/Right page, A details, Y enable/disable, X uninstall |
+| Combos | Up/Down select, A edit, Y enable/disable, X delete, - new combo |
+| Combo editor | Up/Down select, A add/remove mod, X move up, Y move down, - save and build, B back |
 | Downloads | Up/Down select, A retry a failed or cancelled job, X cancel, Y clear finished |
 | Repos | Up/Down select, Y reload |
 
@@ -266,7 +300,7 @@ Notes:
 - SDCafiine loads one modpack per game. If more than one mod is enabled for the
   same title, SDCafiine asks which one to load when the game starts. PatchBay
   warns about this when you queue an install; disable the ones you do not want
-  from the Installed tab.
+  from the Installed tab, or merge them into a combo.
 
 ## Limitations
 
@@ -276,8 +310,10 @@ Notes:
 - Encrypted (password-protected) ZIPs are not supported.
 - The SD card is FAT32, so no single file (including the downloaded ZIP) can be
   4 GiB or larger.
-- SDCafiine loads one modpack at a time per game. Mods are not merged; pick a
-  modpack that bundles what you want, or enable one mod at a time.
+- SDCafiine loads one modpack at a time per game. To use several mods
+  together, build a combo; it is a full copy and uses extra SD space. File
+  conflicts are resolved by priority only; files are never merged at the
+  content level.
 - Updates are only detected for mods installed by PatchBay (adopted mods have
   no known version).
 

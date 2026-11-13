@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <map>
 
 namespace {
 
@@ -17,7 +18,8 @@ constexpr int kContentH = Gfx::H - kHeaderH - kFooterH - 24;
 constexpr int kMargin = 40;
 constexpr int kRowH = 64;
 
-const Screen kTabs[] = {Screen::Games, Screen::Installed, Screen::Queue, Screen::Repos};
+const Screen kTabs[] = {Screen::Games, Screen::Installed, Screen::Combos, Screen::Queue, Screen::Repos};
+constexpr int kTabCount = (int) (sizeof(kTabs) / sizeof(kTabs[0]));
 
 std::string join(const std::vector<std::string> &v, const std::string &sep) {
     std::string out;
@@ -94,6 +96,8 @@ void App::shutdown() {
     // Order matters: stop threads that use curl before tearing it down.
     http::abortAll();
     loader_.reset();
+    planCancel_ = true;
+    planWorker_.reset();
     jobs_.reset();
     images_.reset();
     http::globalCleanup();
@@ -263,13 +267,13 @@ void App::handle(Btn b) {
     if (exiting_) return;
 
     // Top-level tab switching.
-    bool topLevel = screen_ == Screen::Games || screen_ == Screen::Installed || screen_ == Screen::Queue ||
-                    screen_ == Screen::Repos;
+    bool topLevel = screen_ == Screen::Games || screen_ == Screen::Installed || screen_ == Screen::Combos ||
+                    screen_ == Screen::Queue || screen_ == Screen::Repos;
     if (topLevel && (b == Btn::L || b == Btn::R)) {
         int idx = 0;
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < kTabCount; ++i)
             if (kTabs[i] == screen_) idx = i;
-        idx = (idx + (b == Btn::R ? 1 : 3)) % 4;
+        idx = (idx + (b == Btn::R ? 1 : kTabCount - 1)) % kTabCount;
         screen_ = kTabs[idx];
         return;
     }
@@ -284,6 +288,8 @@ void App::handle(Btn b) {
     case Screen::Mods: handleMods(b); break;
     case Screen::Detail: handleDetail(b); break;
     case Screen::Installed: handleInstalled(b); break;
+    case Screen::Combos: handleCombos(b); break;
+    case Screen::ComboEdit: handleComboEdit(b); break;
     case Screen::Queue: handleQueue(b); break;
     case Screen::Repos: handleRepos(b); break;
     }
@@ -588,9 +594,13 @@ void App::handleQueue(Btn b) {
         auto &v = jobs[(size_t) queueList_.sel];
         if (v.state == JobState::Failed || v.state == JobState::Cancelled) {
             // Retry.
-            const Game *g = nullptr;
-            const Mod *m = catalog_.findMod(v.job->mod.id, &g);
-            if (m) jobs_->enqueue(*m, v.job->gameName, v.job->titleId);
+            if (v.job->isCombo) {
+                jobs_->enqueueCombo(v.job->mod.id, v.job->gameName, v.job->titleId);
+            } else {
+                const Game *g = nullptr;
+                const Mod *m = catalog_.findMod(v.job->mod.id, &g);
+                if (m) jobs_->enqueue(*m, v.job->gameName, v.job->titleId);
+            }
         }
     }
 }
@@ -613,6 +623,8 @@ void App::draw() {
     case Screen::Mods: drawMods(); break;
     case Screen::Detail: drawDetail(); break;
     case Screen::Installed: drawInstalled(); break;
+    case Screen::Combos: drawCombos(); break;
+    case Screen::ComboEdit: drawComboEdit(); break;
     case Screen::Queue: drawQueue(); break;
     case Screen::Repos: drawRepos(); break;
     }
@@ -628,24 +640,25 @@ void App::drawHeader() {
 
     if (screen_ == Screen::Loading) return;
 
-    const char *names[] = {"Games", "Installed", "Downloads", "Repos"};
+    const char *names[] = {"Games", "Installed", "Combos", "Downloads", "Repos"};
     Screen active = screen_;
+    if (active == Screen::ComboEdit) active = Screen::Combos;
     if (active == Screen::Mods) active = Screen::Games;
     if (active == Screen::Detail) active = detailReturn_ == Screen::Installed ? Screen::Installed : Screen::Games;
 
     int tx = Gfx::W - kMargin;
-    for (int i = 3; i >= 0; --i) {
+    for (int i = kTabCount - 1; i >= 0; --i) {
         std::string label = names[i];
         if (kTabs[i] == Screen::Queue) {
             int n = jobs_->activeCount();
             if (n) label += " (" + std::to_string(n) + ")";
         }
-        int w = gfx_.textWidth(label, FontSize::Normal) + 32;
+        int w = gfx_.textWidth(label, FontSize::Normal) + 24;
         tx -= w;
         bool on = kTabs[i] == active;
         if (on) gfx_.fill(tx, 14, w, 44, color::PanelHi);
         gfx_.text(label, tx, 22, FontSize::Normal, on ? color::Accent : color::Dim, w, 1);
-        tx -= 6;
+        tx -= 4;
     }
     gfx_.text("L", tx - 30, 22, FontSize::Normal, color::Dim);
     gfx_.text("R", Gfx::W - kMargin + 10, 22, FontSize::Normal, color::Dim);
@@ -853,6 +866,11 @@ void App::drawDetail() {
                 color::Warn);
         }
     }
+    auto inCombos = installer_.combosContaining(m->id);
+    if (!inCombos.empty()) {
+        lines.push_back({"", color::Text});
+        add("In combo: " + join(inCombos, ", "), color::Accent2);
+    }
     if (!m->changelog.empty()) {
         lines.push_back({"", color::Text});
         add("Changelog", color::Accent);
@@ -899,6 +917,8 @@ void App::drawInstalled() {
         gfx_.text(im.name, kMargin + 20, y + 6, FontSize::Normal, im.enabled ? color::Text : color::Dim, 640);
         std::string sub = im.gameName + "  |  " + im.titleId + "  |  " +
                           (im.version.empty() ? std::string("version unknown") : "v" + im.version);
+        auto inCombos = installer_.combosContaining(im.id);
+        if (!inCombos.empty()) sub += " | in " + join(inCombos, ", ");
         gfx_.text(sub, kMargin + 20, y + 36, FontSize::Small, color::Dim, 760);
 
         const Mod *m = catalog_.findMod(im.id);
@@ -943,7 +963,8 @@ void App::drawQueue() {
             st += "  " + formatSize(v.done) + " / " + formatSize(v.total);
         }
         gfx_.text(st, kMargin + 20, y + 38, FontSize::Small, c, 900);
-        if (v.state == JobState::Downloading || v.state == JobState::Verifying || v.state == JobState::Extracting)
+        if (v.state == JobState::Downloading || v.state == JobState::Verifying || v.state == JobState::Extracting ||
+            v.state == JobState::Building)
             drawProgressBar(kMargin + 20, y + rowH - 22, Gfx::W - 2 * kMargin - 40, 6, v.done, v.total, c);
         gfx_.text(v.job->gameName, Gfx::W - kMargin - 320, y + 10, FontSize::Small, color::Dim, 300, 2);
     }
@@ -1039,5 +1060,366 @@ void App::drawModal() {
         if (sel) gfx_.fill(x + 40, ty, 5, 44, color::Accent);
         gfx_.text(modal_.options[i], x + 60, ty + 8, FontSize::Normal, sel ? color::Text : color::Dim, w - 120);
         ty += 52;
+    }
+}
+
+// ---------------------------------------------------------------- combos
+
+void App::newCombo() {
+    // Titles with at least two installed mods.
+    std::vector<std::string> tids, names;
+    std::map<std::string, std::pair<std::string, int>> byTitle; // titleId -> (game name, count)
+    for (auto &im : installer_.list()) {
+        auto &e = byTitle[im.titleId];
+        if (e.first.empty()) e.first = im.gameName;
+        e.second++;
+    }
+    for (auto &kv : byTitle) {
+        if (kv.second.second < 2) continue;
+        tids.push_back(kv.first);
+        names.push_back(kv.second.first);
+    }
+    if (tids.empty()) {
+        message("New combo", "Install at least two mods for the same game first.");
+        return;
+    }
+    auto start = [this, tids, names](int i) {
+        if (i < 0 || i >= (int) tids.size()) return;
+        Combo c;
+        c.titleId = tids[(size_t) i];
+        c.gameName = names[(size_t) i];
+        c.id = installer_.nextComboId(c.titleId);
+        openComboEditor(c, true);
+    };
+    if (tids.size() == 1) {
+        start(0);
+        return;
+    }
+    std::vector<std::string> labels;
+    for (size_t i = 0; i < tids.size(); ++i) labels.push_back(names[i] + " (" + tids[i] + ")");
+    choose("New combo", "Combine mods for which game?", labels, start);
+}
+
+void App::openComboEditor(const Combo &combo, bool isNew) {
+    comboEdit_ = combo;
+    comboIsNew_ = isNew;
+    comboDirty_ = isNew;
+    comboEditList_ = ListState();
+    comboPlanNeeded_ = true;
+    screen_ = Screen::ComboEdit;
+}
+
+std::vector<App::ComboRow> App::comboEditRows() const {
+    std::vector<ComboRow> rows;
+    for (size_t i = 0; i < comboEdit_.members.size(); ++i) {
+        const std::string &id = comboEdit_.members[i];
+        InstalledMod im;
+        rows.push_back({id, installer_.get(id, im) ? im.name : id, (int) i});
+    }
+    for (auto &im : installer_.list()) {
+        if (im.titleId != comboEdit_.titleId) continue;
+        if (std::find(comboEdit_.members.begin(), comboEdit_.members.end(), im.id) != comboEdit_.members.end())
+            continue;
+        rows.push_back({im.id, im.name, -1});
+    }
+    return rows;
+}
+
+void App::selectComboRow(const std::string &modId) {
+    auto rows = comboEditRows();
+    for (size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].modId == modId) comboEditList_.sel = (int) i;
+    comboEditList_.clamp((int) rows.size(), (kContentH - 80) / kRowH);
+}
+
+void App::updateComboPlan() {
+    if (!comboPlanNeeded_) return;
+    uint32_t gen;
+    {
+        std::lock_guard<std::mutex> lock(planMutex_);
+        if (planRunning_) return; // start again once the current run finishes
+        planRunning_ = true;
+        gen = ++planGen_;
+    }
+    comboPlanNeeded_ = false;
+    planWorker_.reset(); // previous run already finished, joins at once
+
+    std::string tid = comboEdit_.titleId;
+    std::vector<std::string> members = comboEdit_.members;
+    auto work = [this, gen, tid, members] {
+        ComboPlan p = installer_.planCombo(tid, members, &planCancel_);
+        int files = (int) p.copies.size();
+        p.copies.clear();
+        p.copies.shrink_to_fit();
+        std::lock_guard<std::mutex> lock(planMutex_);
+        planRunning_ = false;
+        if (gen != planGen_) return;
+        plan_ = std::move(p);
+        planFiles_ = files;
+        planResultGen_ = gen;
+    };
+    planWorker_.reset(new Worker(work));
+    if (!planWorker_->ok()) {
+        // No thread available. Walking big mods here would freeze the UI, so
+        // skip the preview; the build itself still works.
+        planWorker_.reset();
+        std::lock_guard<std::mutex> lock(planMutex_);
+        planRunning_ = false;
+    }
+}
+
+void App::saveAndBuildCombo() {
+    if (comboEdit_.members.size() < 2) {
+        message("Combo", "A combo needs at least two mods.");
+        return;
+    }
+    JobQueue::View v;
+    if (jobs_->activeFor(comboEdit_.id, v)) {
+        message("Combo", comboEdit_.id + " is already being built.");
+        return;
+    }
+    installer_.saveComboDefinition(comboEdit_);
+    jobs_->enqueueCombo(comboEdit_.id, comboEdit_.gameName, comboEdit_.titleId);
+    comboDirty_ = false;
+    comboIsNew_ = false;
+
+    auto list = installer_.combos();
+    for (size_t i = 0; i < list.size(); ++i)
+        if (list[i].id == comboEdit_.id) combosList_.sel = (int) i;
+    combosList_.clamp((int) list.size(), visibleRows(kRowH));
+    screen_ = Screen::Combos;
+    message("Building combo", comboEdit_.id + " was added to the download queue. Member mods are disabled once it "
+                                              "is built so SDCafiine loads only the combo.");
+}
+
+void App::handleCombos(Btn b) {
+    auto list = installer_.combos();
+    int n = (int) list.size();
+    int vis = visibleRows(kRowH);
+    combosList_.clamp(n, vis);
+    if (b == Btn::Up) combosList_.move(-1, n, vis);
+    else if (b == Btn::Down) combosList_.move(1, n, vis);
+    else if (b == Btn::Left) combosList_.move(-vis, n, vis);
+    else if (b == Btn::Right) combosList_.move(vis, n, vis);
+    else if (b == Btn::Minus) newCombo();
+    else if (n > 0) {
+        const Combo c = list[(size_t) combosList_.sel];
+        JobQueue::View v;
+        bool busy = jobs_->activeFor(c.id, v);
+        if (b == Btn::A) {
+            openComboEditor(c, false);
+        } else if (b == Btn::Y) {
+            if (busy) {
+                message("Combo", c.id + " is being built. Try again when it is done.");
+                return;
+            }
+            std::string err;
+            if (!installer_.setComboEnabled(c.id, !c.enabled, err)) message("Error", err);
+        } else if (b == Btn::X) {
+            if (busy) {
+                message("Combo", c.id + " is being built. Cancel it from the Downloads tab first.");
+                return;
+            }
+            std::string id = c.id;
+            choose("Delete combo", "Delete " + id + " from the SD card? Member mods are kept.", {"Cancel", "Delete"},
+                   [this, id](int i) {
+                       if (i != 1) return;
+                       std::string err;
+                       if (!installer_.deleteCombo(id, err)) message("Delete failed", err);
+                   });
+        }
+    }
+}
+
+void App::handleComboEdit(Btn b) {
+    auto rows = comboEditRows();
+    int n = (int) rows.size();
+    int vis = (kContentH - 80) / kRowH;
+    comboEditList_.clamp(n, vis);
+    auto &members = comboEdit_.members;
+
+    if (b == Btn::Up) comboEditList_.move(-1, n, vis);
+    else if (b == Btn::Down) comboEditList_.move(1, n, vis);
+    else if (b == Btn::Left) comboEditList_.move(-vis, n, vis);
+    else if (b == Btn::Right) comboEditList_.move(vis, n, vis);
+    else if (b == Btn::Minus) saveAndBuildCombo();
+    else if (b == Btn::B) {
+        if (!comboDirty_) {
+            screen_ = Screen::Combos;
+            return;
+        }
+        choose("Combo", "Discard changes?", {"Keep editing", "Discard"}, [this](int i) {
+            if (i != 1) return;
+            comboDirty_ = false;
+            screen_ = Screen::Combos;
+        });
+    } else if (n > 0) {
+        const ComboRow row = rows[(size_t) comboEditList_.sel];
+        int mi = row.memberIndex;
+        bool changed = false;
+        if (b == Btn::A) {
+            if (mi >= 0) members.erase(members.begin() + mi);
+            else members.push_back(row.modId);
+            changed = true;
+        } else if (b == Btn::X && mi > 0) {
+            std::swap(members[(size_t) mi], members[(size_t) mi - 1]);
+            changed = true;
+        } else if (b == Btn::Y && mi >= 0 && mi + 1 < (int) members.size()) {
+            std::swap(members[(size_t) mi], members[(size_t) mi + 1]);
+            changed = true;
+        }
+        if (changed) {
+            comboDirty_ = true;
+            comboPlanNeeded_ = true;
+            selectComboRow(row.modId);
+        }
+    }
+}
+
+void App::drawCombos() {
+    auto list = installer_.combos();
+    int vis = visibleRows(kRowH);
+    combosList_.clamp((int) list.size(), vis);
+
+    std::string hints = "A Edit";
+    if (!list.empty()) {
+        const Combo &c = list[(size_t) combosList_.sel];
+        if (c.built && installer_.comboStale(c)) hints = "A Edit/Rebuild";
+    }
+    drawFooter(hints + "    Y Enable/Disable    X Delete    - New combo    L/R Tabs    + Exit");
+
+    if (list.empty()) {
+        gfx_.text("No combos. Press - to combine installed mods for a game.", 0, 320, FontSize::Large, color::Dim,
+                  Gfx::W, 1);
+        return;
+    }
+    for (int r = 0; r < vis; ++r) {
+        int i = combosList_.scroll + r;
+        if (i >= (int) list.size()) break;
+        const Combo &c = list[(size_t) i];
+        int y = kContentY + r * kRowH;
+        bool sel = i == combosList_.sel;
+        gfx_.fill(kMargin, y, Gfx::W - 2 * kMargin, kRowH - 6, sel ? color::PanelHi : color::Panel);
+        if (sel) gfx_.fill(kMargin, y, 5, kRowH - 6, color::Accent);
+
+        gfx_.text(c.id, kMargin + 20, y + 6, FontSize::Normal, c.enabled ? color::Text : color::Dim, 640);
+        std::string sub = c.gameName + "  |  " + c.titleId + "  |  " + std::to_string(c.members.size()) + " mods";
+        if (c.built) sub += "  |  " + formatSize(c.sizeBytes);
+        gfx_.text(sub, kMargin + 20, y + 36, FontSize::Small, color::Dim, 760);
+
+        SDL_Color sc = color::Dim;
+        std::string st;
+        JobQueue::View v;
+        if (jobs_->activeFor(c.id, v)) {
+            sc = color::Accent2;
+            if (v.state == JobState::Queued) {
+                st = "Queued";
+            } else {
+                int pct = v.total > 0 ? (int) (v.done * 100 / v.total) : 0;
+                st = std::string(jobStateName(v.state)) + " " + std::to_string(pct) + "%";
+            }
+        } else if (!c.built) {
+            sc = color::Warn;
+            st = "Not built";
+        } else if (installer_.comboStale(c)) {
+            sc = color::Warn;
+            st = "Needs rebuild";
+        } else if (c.enabled) {
+            sc = color::Good;
+            st = "Enabled";
+        } else {
+            st = "Disabled";
+        }
+        gfx_.text(st, Gfx::W - kMargin - 300, y + 18, FontSize::Normal, sc, 280, 2);
+    }
+}
+
+void App::drawComboEdit() {
+    updateComboPlan();
+    drawFooter("A Add/Remove    X Move up    Y Move down    - Save & build    B Back");
+
+    const int panelW = 420;
+    const int listW = Gfx::W - 2 * kMargin - panelW - 24;
+    gfx_.text(comboEdit_.id + (comboIsNew_ ? "  (new)" : "") + (comboDirty_ ? "  *" : ""), kMargin, kContentY,
+              FontSize::Large, color::Text, listW);
+    gfx_.text(comboEdit_.gameName + "  |  " + comboEdit_.titleId, kMargin, kContentY + 42, FontSize::Small,
+              color::Dim, listW);
+
+    const int top = kContentY + 80;
+    int vis = (kContentH - 80) / kRowH;
+    auto rows = comboEditRows();
+    comboEditList_.clamp((int) rows.size(), vis);
+    if (rows.empty())
+        gfx_.text("No installed mods for this game.", kMargin, top + 20, FontSize::Normal, color::Dim, listW);
+    for (int r = 0; r < vis; ++r) {
+        int i = comboEditList_.scroll + r;
+        if (i >= (int) rows.size()) break;
+        const ComboRow &row = rows[(size_t) i];
+        int y = top + r * kRowH;
+        bool sel = i == comboEditList_.sel;
+        bool member = row.memberIndex >= 0;
+        gfx_.fill(kMargin, y, listW, kRowH - 6, sel ? color::PanelHi : color::Panel);
+        if (sel) gfx_.fill(kMargin, y, 5, kRowH - 6, color::Accent);
+        if (member)
+            gfx_.text("#" + std::to_string(row.memberIndex + 1), kMargin + 16, y + 14, FontSize::Normal,
+                      color::Accent, 60);
+        gfx_.text(row.name, kMargin + 80, y + 6, FontSize::Normal, member ? color::Text : color::Dim, listW - 100);
+        gfx_.text(member ? "In combo" : "Not included", kMargin + 80, y + 36, FontSize::Small,
+                  member ? color::Good : color::Dim, listW - 100);
+    }
+
+    // Right panel: merge preview.
+    const int px = Gfx::W - kMargin - panelW, py = kContentY;
+    const int ph = kContentH;
+    gfx_.fill(px, py, panelW, ph, color::Panel);
+    const int x = px + 20, w = panelW - 40;
+    int y = py + 16;
+    gfx_.text("Preview", x, y, FontSize::Normal, color::Accent, w);
+    y += 44;
+
+    bool ready;
+    ComboPlan plan;
+    int files = 0;
+    {
+        std::lock_guard<std::mutex> lock(planMutex_);
+        ready = !comboPlanNeeded_ && planResultGen_ == planGen_;
+        if (ready) {
+            plan = plan_;
+            files = planFiles_;
+        }
+    }
+    gfx_.text("Members: " + std::to_string(comboEdit_.members.size()), x, y, FontSize::Small, color::Text, w);
+    y += 30;
+    if (!ready) {
+        gfx_.text("Calculating...", x, y, FontSize::Small, color::Dim, w);
+        return;
+    }
+    gfx_.text("Total size: " + formatSize(plan.totalBytes) + "  (" + std::to_string(files) + " files)", x, y,
+              FontSize::Small, color::Text, w);
+    y += 30;
+    gfx_.text("Conflicts: " + std::to_string(plan.conflicts) + " files", x, y, FontSize::Small,
+              plan.conflicts > 0 ? color::Warn : color::Text, w);
+    y += 30;
+
+    const int lh = gfx_.lineHeight(FontSize::Small);
+    const int bottom = py + ph - 16;
+    for (auto &l : plan.missing.empty() ? std::vector<std::string>()
+                                        : gfx_.wrap("Not installed: " + join(plan.missing, ", "), FontSize::Small, w)) {
+        if (y + lh > bottom) break;
+        gfx_.text(l, x, y, FontSize::Small, color::Bad, w);
+        y += lh;
+    }
+
+    auto note = gfx_.wrap("Higher in the list wins when two mods replace the same file.", FontSize::Small, w);
+    int noteY = bottom - (int) note.size() * lh;
+    y += 6;
+    for (size_t i = 0; i < plan.conflictSamples.size() && i < 12; ++i) {
+        if (y + lh > noteY - 6) break;
+        gfx_.text(plan.conflictSamples[i], x, y, FontSize::Small, color::Dim, w);
+        y += lh;
+    }
+    for (auto &l : note) {
+        gfx_.text(l, x, noteY, FontSize::Small, color::Dim, w);
+        noteY += lh;
     }
 }

@@ -9,6 +9,7 @@
 #include <mutex>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 namespace fs {
 
@@ -51,6 +52,47 @@ std::vector<Entry> listDir(const std::string &path) {
     }
     ::closedir(dir);
     return out;
+}
+
+static void walkInto(const std::string &root, const std::string &rel, std::vector<FileInfo> &out) {
+    std::string dir = rel.empty() ? root : root + "/" + rel;
+    for (const auto &e : listDir(dir)) {
+        std::string r = rel.empty() ? e.name : rel + "/" + e.name;
+        if (e.isDir) walkInto(root, r, out);
+        else out.push_back({r, fileSize(root + "/" + r)});
+    }
+}
+
+std::vector<FileInfo> walkFiles(const std::string &root) {
+    std::vector<FileInfo> out;
+    walkInto(root, "", out);
+    return out;
+}
+
+bool copyFile(const std::string &from, const std::string &to, const std::function<void(int64_t)> &onBytes,
+              const std::atomic<bool> *cancel) {
+    FILE *in = ::fopen(from.c_str(), "rb");
+    if (!in) return false;
+    FILE *out = ::fopen(to.c_str(), "wb");
+    if (!out) {
+        ::fclose(in);
+        return false;
+    }
+    std::vector<char> buf(512 * 1024);
+    bool ok = true;
+    size_t n;
+    while ((n = ::fread(buf.data(), 1, buf.size(), in)) > 0) {
+        if ((cancel && cancel->load()) || ::fwrite(buf.data(), 1, n, out) != n) {
+            ok = false;
+            break;
+        }
+        if (onBytes) onBytes((int64_t) n);
+    }
+    if (::ferror(in)) ok = false;
+    ::fclose(in);
+    ok = (::fclose(out) == 0) && ok;
+    if (!ok) ::remove(to.c_str());
+    return ok;
 }
 
 bool removeAll(const std::string &path) {

@@ -17,7 +17,7 @@
 
 enum class Btn { Up, Down, Left, Right, A, B, X, Y, L, R, Plus, Minus, None };
 
-enum class Screen { Loading, Games, Mods, Detail, Installed, Queue, Repos };
+enum class Screen { Loading, Games, Mods, Detail, Installed, Combos, ComboEdit, Queue, Repos };
 
 struct ListState {
     int sel = 0;
@@ -53,6 +53,8 @@ private:
     void drawInstalled();
     void drawQueue();
     void drawRepos();
+    void drawCombos();
+    void drawComboEdit();
     void drawModal();
     void drawProgressBar(int x, int y, int w, int h, int64_t done, int64_t total, SDL_Color c);
 
@@ -62,6 +64,8 @@ private:
     void handleInstalled(Btn b);
     void handleQueue(Btn b);
     void handleRepos(Btn b);
+    void handleCombos(Btn b);
+    void handleComboEdit(Btn b);
 
     // Actions
     void requestInstall(const Game &game, const Mod &mod);
@@ -69,6 +73,20 @@ private:
     void toggleEnabled(const std::string &modId);
     void openDetail(const std::string &modId);
     void requestExit();
+    void newCombo();
+    void openComboEditor(const Combo &combo, bool isNew);
+    void saveAndBuildCombo();
+
+    // Combo editor rows: members (priority order) first, then other installed
+    // mods for the same title.
+    struct ComboRow {
+        std::string modId;
+        std::string name;
+        int memberIndex; // -1 = not a member
+    };
+    std::vector<ComboRow> comboEditRows() const;
+    void selectComboRow(const std::string &modId);
+    void updateComboPlan();
 
     // Helpers
     const Game *currentGame() const;
@@ -107,9 +125,27 @@ private:
     Catalog loadResult_;
     Config loadConfig_;
 
+    // Combo editor
+    Combo comboEdit_;
+    bool comboIsNew_ = false;
+    bool comboDirty_ = false;
+    bool comboPlanNeeded_ = false;
+
+    // Background merge preview (planCombo walks the SD card). planGen_ is
+    // written on the UI thread under planMutex_; results from an older
+    // generation are dropped.
+    std::unique_ptr<Worker> planWorker_;
+    std::atomic<bool> planCancel_{false};
+    std::mutex planMutex_;
+    bool planRunning_ = false;
+    uint32_t planGen_ = 0;
+    uint32_t planResultGen_ = 0;
+    ComboPlan plan_; // copies cleared; see planFiles_
+    int planFiles_ = 0;
+
     Screen screen_ = Screen::Loading;
     Screen detailReturn_ = Screen::Mods;
-    ListState gamesList_, modsList_, installedList_, queueList_, reposList_;
+    ListState gamesList_, modsList_, installedList_, queueList_, reposList_, combosList_, comboEditList_;
     int detailScroll_ = 0;
     int detailMaxScroll_ = 0;
     std::string detailModId_;

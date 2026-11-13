@@ -10,6 +10,7 @@ const char *jobStateName(JobState s) {
     case JobState::Downloading: return "Downloading";
     case JobState::Verifying: return "Verifying";
     case JobState::Extracting: return "Installing";
+    case JobState::Building: return "Building";
     case JobState::Done: return "Done";
     case JobState::Failed: return "Failed";
     case JobState::Cancelled: return "Cancelled";
@@ -19,7 +20,7 @@ const char *jobStateName(JobState s) {
 
 static bool isActive(JobState s) {
     return s == JobState::Queued || s == JobState::Downloading || s == JobState::Verifying ||
-           s == JobState::Extracting;
+           s == JobState::Extracting || s == JobState::Building;
 }
 
 JobQueue::JobQueue(Installer &installer) : installer_(installer) {
@@ -46,6 +47,24 @@ void JobQueue::enqueue(const Mod &mod, const std::string &gameName, const std::s
     job->gameName = gameName;
     job->titleId = titleId;
     job->total = mod.fileSize;
+    pending_.push_back(job);
+    all_.push_back(job);
+    cv_.notify_one();
+}
+
+void JobQueue::enqueueCombo(const std::string &comboId, const std::string &gameName,
+                            const std::string &titleId) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto &j : all_)
+        if (j->mod.id == comboId && isActive(j->state)) return; // already queued
+
+    auto job = std::make_shared<Job>();
+    job->isCombo = true;
+    job->mod.id = comboId;
+    job->mod.name = "Combo " + comboId;
+    job->gameName = gameName;
+    job->titleId = titleId;
+    job->total = -1;
     pending_.push_back(job);
     all_.push_back(job);
     cv_.notify_one();
@@ -127,13 +146,25 @@ void JobQueue::run() {
 void JobQueue::process(const std::shared_ptr<Job> &job) {
     Job &j = *job;
     const Mod &m = j.mod;
-    std::string zipPath = paths::downloadFile(m.id);
     auto fail = [&](const std::string &msg) {
         fs::log("job %s failed: %s", m.id.c_str(), msg.c_str());
         std::lock_guard<std::mutex> lock(mutex_);
         j.error = msg;
         j.state = j.cancel ? JobState::Cancelled : JobState::Failed;
     };
+
+    // Combo: assemble from installed mods; nothing to download.
+    if (j.isCombo) {
+        setState(j, JobState::Building);
+        std::string err;
+        bool ok = installer_.buildCombo(m.id, [&](int64_t d, int64_t t) { setProgress(j, d, t); }, &j.cancel, err);
+        if (!ok) return fail(err.empty() && j.cancel ? "Cancelled" : err);
+        std::lock_guard<std::mutex> lock(mutex_);
+        j.state = JobState::Done;
+        return;
+    }
+
+    std::string zipPath = paths::downloadFile(m.id);
 
     // 1. Download (skipped if a complete file from an earlier attempt exists).
     setState(j, JobState::Downloading);

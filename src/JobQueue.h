@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-enum class JobState { Queued, Downloading, Verifying, Extracting, Done, Failed, Cancelled };
+enum class JobState { Queued, Downloading, Verifying, Extracting, Building, Done, Failed, Cancelled };
 
 const char *jobStateName(JobState s);
 
@@ -20,6 +20,7 @@ struct Job {
     Mod mod;
     std::string gameName;
     std::string titleId;
+    bool isCombo = false; // mod.id holds the combo id; built, not downloaded
 
     // Written by the worker, read by the UI (under JobQueue's mutex).
     JobState state = JobState::Queued;
@@ -38,6 +39,8 @@ public:
     ~JobQueue();
 
     void enqueue(const Mod &mod, const std::string &gameName, const std::string &titleId);
+    // Queues a combo build (Installer::buildCombo). mod.id = comboId.
+    void enqueueCombo(const std::string &comboId, const std::string &gameName, const std::string &titleId);
     void cancel(const std::shared_ptr<Job> &job);
     void clearFinished();
 
