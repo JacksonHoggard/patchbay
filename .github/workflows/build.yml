@@ -17,12 +17,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Wii U portlibs
+      # The devkitppc image already ships most portlibs. Only reach for the
+      # package server when something is missing: it sometimes rejects CI
+      # runners (HTTP 403), so retry a few times.
+      - name: Install missing Wii U portlibs
+        shell: bash
         run: |
-          dkp-pacman -Syu --noconfirm --needed \
-            wut wiiu-cmake wiiu-pkg-config \
-            wiiu-sdl2 wiiu-sdl2_ttf wiiu-sdl2_image wiiu-curl wiiu-mbedtls ppc-zlib \
-            ppc-liblzma ppc-bzip2
+          pkgs="wut wiiu-cmake wiiu-pkg-config wiiu-sdl2 wiiu-sdl2_ttf wiiu-sdl2_image wiiu-curl wiiu-mbedtls ppc-zlib ppc-liblzma ppc-bzip2"
+          missing=""
+          for p in $pkgs; do dkp-pacman -Q "$p" >/dev/null 2>&1 || missing="$missing $p"; done
+          if [ -z "$missing" ]; then echo "All portlibs present"; exit 0; fi
+          echo "Installing:$missing"
+          for i in 1 2 3 4 5; do
+            dkp-pacman -Sy --noconfirm --needed $missing && exit 0
+            echo "attempt $i failed; retrying in $((i * 15)) s"; sleep $((i * 15))
+          done
+          exit 1
 
       - name: Check tag matches project version
         if: startsWith(github.ref, 'refs/tags/v')
