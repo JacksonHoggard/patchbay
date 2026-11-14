@@ -203,6 +203,7 @@ private:
     uint32_t planGen_ = 0;
     uint32_t planResultGen_ = 0;
     ComboPlan plan_; // copies cleared; see planFiles_
+    ComboPlanProgress planProgress_; // live counters of the running plan
     int planFiles_ = 0;
 
     Screen screen_ = Screen::Loading;

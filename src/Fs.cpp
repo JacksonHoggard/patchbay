@@ -54,18 +54,46 @@ std::vector<Entry> listDir(const std::string &path) {
     return out;
 }
 
-static void walkInto(const std::string &root, const std::string &rel, std::vector<FileInfo> &out) {
+static void walkInto(const std::string &root, const std::string &rel, std::vector<FileInfo> &out,
+                     const std::function<void()> &onFile, const std::atomic<bool> *cancel) {
     std::string dir = rel.empty() ? root : root + "/" + rel;
-    for (const auto &e : listDir(dir)) {
-        std::string r = rel.empty() ? e.name : rel + "/" + e.name;
-        if (e.isDir) walkInto(root, r, out);
-        else out.push_back({r, fileSize(root + "/" + r)});
+    DIR *d = ::opendir(dir.c_str());
+    if (!d) return;
+    std::vector<std::string> subdirs;
+    struct dirent *ent;
+    while ((ent = ::readdir(d)) != nullptr) {
+        if (cancel && cancel->load()) break;
+        std::string name = ent->d_name;
+        if (name == "." || name == "..") continue;
+        std::string r = rel.empty() ? name : rel + "/" + name;
+#ifdef _DIRENT_HAVE_D_STAT
+        // devkitPro's readdir fills in the entry's stat, which saves two
+        // stat() calls per file (slow on the SD card).
+        bool dirEntry = S_ISDIR(ent->d_stat.st_mode);
+        int64_t size = (int64_t) ent->d_stat.st_size;
+#else
+        bool dirEntry = isDir(dir + "/" + name);
+        int64_t size = dirEntry ? 0 : fileSize(dir + "/" + name);
+#endif
+        if (dirEntry) {
+            subdirs.push_back(r);
+        } else {
+            out.push_back({r, size});
+            if (onFile) onFile();
+        }
+    }
+    ::closedir(d);
+    // Recurse after closing, so only one directory handle is open at a time.
+    for (const auto &s : subdirs) {
+        if (cancel && cancel->load()) return;
+        walkInto(root, s, out, onFile, cancel);
     }
 }
 
-std::vector<FileInfo> walkFiles(const std::string &root) {
+std::vector<FileInfo> walkFiles(const std::string &root, const std::function<void()> &onFile,
+                                const std::atomic<bool> *cancel) {
     std::vector<FileInfo> out;
-    walkInto(root, "", out);
+    walkInto(root, "", out, onFile, cancel);
     return out;
 }
 

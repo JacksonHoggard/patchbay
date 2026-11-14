@@ -102,6 +102,12 @@ add_executable(patchbay
     src/ArchiveLibarchive.cpp
     src/Sha256.cpp
     src/Installer.cpp
+    src/GameFiles.cpp
+    src/Merge.cpp
+    src/Bmg.cpp
+    src/Rarc.cpp
+    src/Sarc.cpp
+    src/Yaz0.cpp
     src/Titles.cpp
     src/Worker.cpp
     src/JobQueue.cpp

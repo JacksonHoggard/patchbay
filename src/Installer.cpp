@@ -1,12 +1,16 @@
 #include "Installer.h"
 #include "Archive.h"
 #include "Fs.h"
+#include "GameFiles.h"
+#include "Merge.h"
 #include "Paths.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <new>
 #include <set>
 #include <nlohmann/json.hpp>
 
@@ -14,6 +18,9 @@ using nlohmann::json;
 
 static const char *kOldPrefix = ".patchbay-old-";
 static const char *kStagingPrefix = ".patchbay-staging-";
+// Shared files whose copies add up to more than this are not merged (they
+// would not fit in memory); the highest-priority copy is used.
+static const int64_t kMaxMergeBytes = 96ll * 1024 * 1024;
 
 static std::string lower(const std::string &s) {
     std::string out = s;
@@ -61,7 +68,9 @@ void Installer::load() {
             c.built = v.value("built", false);
             c.builtAt = v.value("builtAt", (int64_t) 0);
             c.sizeBytes = v.value("sizeBytes", (int64_t) 0);
+            c.merged = v.value("merged", 0);
             c.conflicts = v.value("conflicts", 0);
+            c.usedBase = v.value("usedBase", false);
             if (v.contains("members") && v["members"].is_array())
                 for (auto &m : v["members"])
                     if (m.is_string()) c.members.push_back(m.get<std::string>());
@@ -107,7 +116,9 @@ void Installer::saveLocked() {
             {"built", c.built},
             {"builtAt", c.builtAt},
             {"sizeBytes", c.sizeBytes},
+            {"merged", c.merged},
             {"conflicts", c.conflicts},
+            {"usedBase", c.usedBase},
             {"conflictSamples", c.conflictSamples},
             {"builtVersions", c.builtVersions},
             {"restoreEnabled", c.restoreEnabled},
@@ -591,7 +602,7 @@ std::vector<std::string> Installer::combosContaining(const std::string &modId) c
 }
 
 ComboPlan Installer::planCombo(const std::string &titleId, const std::vector<std::string> &members,
-                               const std::atomic<bool> *cancel) const {
+                               const std::atomic<bool> *cancel, ComboPlanProgress *progress) const {
     ComboPlan plan;
     struct Src {
         std::string id, name, dir;
@@ -610,11 +621,23 @@ ComboPlan Installer::planCombo(const std::string &titleId, const std::vector<std
         }
     }
 
-    // FAT is case-insensitive, so conflicts are detected on lower-case paths.
-    std::map<std::string, std::string> winner; // lower rel -> winning mod name
-    for (const auto &s : srcs) {
+    // FAT is case-insensitive, so shared files are detected on lower-case paths.
+    struct Entry {
+        std::string rel;
+        std::vector<std::string> srcs, names;
+        std::vector<int64_t> sizes;
+    };
+    std::vector<Entry> entries;
+    std::map<std::string, size_t> index; // lower rel -> entries[]
+    time_t started = std::time(nullptr);
+    if (progress) progress->members = (int) srcs.size();
+    std::function<void()> onFile;
+    if (progress) onFile = [progress] { progress->files++; };
+    for (size_t si = 0; si < srcs.size(); ++si) {
+        const Src &s = srcs[si];
         if (cancel && cancel->load()) break;
-        for (const auto &f : fs::walkFiles(s.dir)) {
+        if (progress) progress->member = (int) si + 1;
+        for (const auto &f : fs::walkFiles(s.dir, onFile, cancel)) {
             std::string rel = f.rel;
             auto slash = rel.find('/');
             std::string top = lower(slash == std::string::npos ? rel : rel.substr(0, slash));
@@ -626,19 +649,168 @@ ComboPlan Installer::planCombo(const std::string &titleId, const std::vector<std
                 rel = top + rel.substr(slash);
 
             std::string key = lower(rel);
-            auto w = winner.find(key);
-            if (w != winner.end()) {
-                plan.conflicts++;
-                if (plan.conflictSamples.size() < 200)
-                    plan.conflictSamples.push_back(rel + ": " + w->second + " over " + s.name);
-                continue;
+            auto it = index.find(key);
+            if (it == index.end()) {
+                it = index.emplace(key, entries.size()).first;
+                entries.push_back({rel, {}, {}, {}});
             }
-            winner[key] = s.name;
-            plan.copies.push_back({s.dir + "/" + f.rel, rel, f.size});
-            plan.totalBytes += f.size;
+            Entry &e = entries[it->second];
+            e.srcs.push_back(s.dir + "/" + f.rel);
+            e.names.push_back(s.name);
+            e.sizes.push_back(f.size);
         }
     }
+
+    for (auto &e : entries) {
+        if (e.srcs.size() == 1) {
+            plan.copies.push_back({e.srcs[0], e.rel, e.sizes[0]});
+            plan.totalBytes += e.sizes[0];
+            plan.workBytes += e.sizes[0];
+            continue;
+        }
+        ComboPlan::Merge m;
+        m.srcs = std::move(e.srcs);
+        m.rel = e.rel;
+        m.srcBytes = 0;
+        for (auto sz : e.sizes) m.srcBytes += sz;
+        plan.totalBytes += e.sizes[0]; // estimate: a merge is about as big as one copy
+        plan.workBytes += m.srcBytes;
+        if (plan.sharedSamples.size() < 200) {
+            std::string who;
+            for (size_t i = 0; i < e.names.size(); ++i) who += (i ? " + " : "") + e.names[i];
+            plan.sharedSamples.push_back(e.rel + ": " + who);
+        }
+        plan.merges.push_back(std::move(m));
+    }
+    plan.shared = (int) plan.merges.size();
+    fs::log("plan %s: %d members, %d files, %d shared, scanned in %lds", titleId.c_str(), (int) srcs.size(),
+            (int) entries.size(), plan.shared, (long) (std::time(nullptr) - started));
+    // A shared file can be one the mods add, so look at a few.
+    if (progress) progress->checkingBase = true;
+    for (size_t i = 0; i < plan.merges.size() && i < 8 && !plan.baseAvailable; ++i) {
+        if (cancel && cancel->load()) break;
+        plan.baseAvailable = gamefiles::exists(titleId, plan.merges[i].rel);
+    }
+    if (!plan.merges.empty())
+        fs::log("plan %s: original game files %s (%lds total)", titleId.c_str(),
+                plan.baseAvailable ? "found" : "not found", (long) (std::time(nullptr) - started));
     return plan;
+}
+
+static bool writeWholeFile(const std::string &path, const std::string &data) {
+    FILE *f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = data.empty() || std::fwrite(data.data(), 1, data.size(), f) == data.size();
+    return std::fclose(f) == 0 && ok;
+}
+
+// ---- Size tables (Twilight Princess HD)
+//
+// TPHD lists the size of every file in content/FileSizeList.txt, and the
+// compressed and decompressed size of every .pack.gz in
+// content/DecompressedSizeList.txt. The game trusts these, so a file whose
+// listed size is wrong breaks the area that loads it. Every mod ships its own
+// full copy of both lists, so a combo rewrites them from the files it
+// actually contains.
+
+static bool isSizeTable(const std::string &rel) {
+    std::string l = lower(rel);
+    return l == "content/filesizelist.txt" || l == "content/decompressedsizelist.txt";
+}
+
+// "a\0b\0" -> {"a", "b", ""}; joinNul reverses it exactly.
+static std::vector<std::string> splitNul(const std::string &s) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == '\0') {
+            out.push_back(s.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+static std::string joinNul(const std::vector<std::string> &parts) {
+    std::string out;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i) out.push_back('\0');
+        out += parts[i];
+    }
+    return out;
+}
+
+// Uncompressed size from a gzip file's trailer (ISIZE, little-endian).
+static bool gzipSizes(const std::string &path, int64_t &comp, uint32_t &decomp) {
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    unsigned char t[4];
+    bool ok = std::fseek(f, 0, SEEK_END) == 0;
+    long size = ok ? std::ftell(f) : -1;
+    ok = ok && size >= 18 && std::fseek(f, size - 4, SEEK_SET) == 0 && std::fread(t, 1, 4, f) == 4;
+    std::fclose(f);
+    if (!ok) return false;
+    comp = size;
+    decomp = (uint32_t) t[0] | (uint32_t) t[1] << 8 | (uint32_t) t[2] << 16 | (uint32_t) t[3] << 24;
+    return true;
+}
+
+// `files` holds the lower-case paths ("content/...") of every file in the combo.
+static void fixSizeTables(const std::string &staging, const std::set<std::string> &files, const std::string &id) {
+    const std::string content = staging + "/content";
+    int fixed = 0;
+
+    // DecompressedSizeList first: FileSizeList lists its size.
+    std::string text;
+    if (files.count("content/decompressedsizelist.txt") &&
+        fs::readFile(content + "/DecompressedSizeList.txt", text)) {
+        // Records: compressed size, decompressed size, ratio, "./DVDRoot/<path>".
+        auto parts = splitNul(text);
+        bool changed = false;
+        for (size_t i = 0; i + 3 < parts.size(); i += 4) {
+            const std::string &p = parts[i + 3];
+            static const std::string prefix = "./DVDRoot/";
+            if (p.compare(0, prefix.size(), prefix) != 0) continue;
+            std::string rel = p.substr(prefix.size()) + ".gz";
+            if (!files.count("content/" + lower(rel))) continue;
+            int64_t comp;
+            uint32_t decomp;
+            if (!gzipSizes(content + "/" + rel, comp, decomp) || decomp == 0) continue;
+            std::string c = std::to_string(comp), d = std::to_string(decomp);
+            if (parts[i] == c && parts[i + 1] == d) continue;
+            double v = std::round((1.0 - (double) comp / decomp) * 1000.0) / 10.0;
+            char pct[32];
+            if (v == std::floor(v)) std::snprintf(pct, sizeof(pct), "%d%%", (int) v);
+            else std::snprintf(pct, sizeof(pct), "%.1f%%", v);
+            parts[i] = c;
+            parts[i + 1] = d;
+            parts[i + 2] = pct;
+            changed = true;
+            fixed++;
+        }
+        if (changed && !writeWholeFile(content + "/DecompressedSizeList.txt", joinNul(parts)))
+            fs::log("combo %s: cannot rewrite DecompressedSizeList.txt", id.c_str());
+    }
+
+    if (files.count("content/filesizelist.txt") && fs::readFile(content + "/FileSizeList.txt", text)) {
+        // Records: "<path>", "<size>".
+        auto parts = splitNul(text);
+        bool changed = false;
+        for (size_t i = 0; i + 1 < parts.size(); i += 2) {
+            std::string key = "content/" + lower(parts[i]);
+            if (key == "content/filesizelist.txt" || !files.count(key)) continue;
+            int64_t size = fs::fileSize(content + "/" + parts[i]);
+            if (size < 0) continue;
+            std::string s = std::to_string(size);
+            if (parts[i + 1] == s) continue;
+            parts[i + 1] = s;
+            changed = true;
+            fixed++;
+        }
+        if (changed && !writeWholeFile(content + "/FileSizeList.txt", joinNul(parts)))
+            fs::log("combo %s: cannot rewrite FileSizeList.txt", id.c_str());
+    }
+    if (fixed) fs::log("combo %s: corrected %d size table entries", id.c_str(), fixed);
 }
 
 bool Installer::swapIn(const std::string &staging, const std::string &final_, const std::string &old,
@@ -675,7 +847,7 @@ bool Installer::buildCombo(const std::string &id, const std::function<void(int64
         fs::log("combo %s: dropping missing member %s", id.c_str(), m.c_str());
         c.members.erase(std::remove(c.members.begin(), c.members.end(), m), c.members.end());
     }
-    if (c.members.empty() || plan.copies.empty()) {
+    if (c.members.empty() || (plan.copies.empty() && plan.merges.empty())) {
         error = "None of the combo's mods are installed";
         return false;
     }
@@ -704,7 +876,7 @@ bool Installer::buildCombo(const std::string &id, const std::function<void(int64
         bool ok = fs::copyFile(cp.src, dst,
                                [&](int64_t n) {
                                    done += n;
-                                   if (progress) progress(done, plan.totalBytes);
+                                   if (progress) progress(done, plan.workBytes);
                                },
                                cancel);
         if (!ok) {
@@ -714,13 +886,112 @@ bool Installer::buildCombo(const std::string &id, const std::function<void(int64
         }
     }
 
+    // Files several members ship: merge them against the game's original.
+    int merged = 0, conflicts = 0;
+    bool usedBase = false;
+    int64_t sizeBytes = 0;
+    for (const auto &cp : plan.copies) sizeBytes += cp.size;
+    std::vector<std::string> conflictSamples;
+    for (const auto &mg : plan.merges) {
+        if (cancel && cancel->load()) {
+            fs::removeAll(staging);
+            error = "Cancelled";
+            return false;
+        }
+        std::string dst = staging + "/" + mg.rel;
+        fs::mkdirs(fs::parent(dst));
+        if (isSizeTable(mg.rel)) {
+            // Regenerated from the combo's files below; any copy will do.
+            if (!fs::copyFile(mg.srcs[0], dst, nullptr, cancel)) {
+                fs::removeAll(staging);
+                error = (cancel && cancel->load()) ? "Cancelled" : "Copy failed for " + mg.rel + " (SD card full?)";
+                return false;
+            }
+            merged++;
+            sizeBytes += fs::fileSize(dst);
+            done += mg.srcBytes;
+            if (progress) progress(done, plan.workBytes);
+            continue;
+        }
+        if (mg.srcBytes > kMaxMergeBytes) {
+            // Too big to hold in memory: take the highest-priority copy.
+            if (!fs::copyFile(mg.srcs[0], dst, nullptr, cancel)) {
+                fs::removeAll(staging);
+                error = (cancel && cancel->load()) ? "Cancelled" : "Copy failed for " + mg.rel + " (SD card full?)";
+                return false;
+            }
+            conflicts++;
+            if (conflictSamples.size() < 200) conflictSamples.push_back(mg.rel + " (too large to merge)");
+            fs::log("combo %s: %s too large to merge", id.c_str(), mg.rel.c_str());
+            sizeBytes += fs::fileSize(dst);
+            done += mg.srcBytes;
+            if (progress) progress(done, plan.workBytes);
+            continue;
+        }
+
+        merge::Result res;
+        {
+            std::vector<std::string> copies(mg.srcs.size());
+            std::vector<const std::string *> ptrs;
+            for (size_t i = 0; i < mg.srcs.size(); ++i) {
+                int64_t sz = fs::fileSize(mg.srcs[i]);
+                if (sz > 0) copies[i].reserve((size_t) sz);
+                if (!fs::readFile(mg.srcs[i], copies[i])) {
+                    fs::removeAll(staging);
+                    error = "Cannot read " + mg.srcs[i];
+                    return false;
+                }
+                ptrs.push_back(&copies[i]);
+            }
+            std::string base;
+            bool haveBase = gamefiles::read(c.titleId, mg.rel, base);
+            usedBase |= haveBase;
+            try {
+                res = merge::mergeFiles(haveBase ? &base : nullptr, ptrs, mg.rel);
+            } catch (const std::bad_alloc &) {
+                res = merge::Result();
+                res.data = std::move(copies[0]);
+                res.conflicts = 1;
+                res.conflictPaths.push_back(mg.rel + " (out of memory while merging)");
+            }
+        }
+        if (res.conflicts == 0) merged++;
+        conflicts += res.conflicts;
+        for (auto &p : res.conflictPaths)
+            if (conflictSamples.size() < 200) conflictSamples.push_back(p);
+        if (res.conflicts) fs::log("combo %s: %d conflict(s) in %s", id.c_str(), res.conflicts, mg.rel.c_str());
+
+        if (!writeWholeFile(dst, res.data)) {
+            fs::removeAll(staging);
+            error = "Write failed for " + mg.rel + " (SD card full?)";
+            return false;
+        }
+        sizeBytes += (int64_t) res.data.size();
+        done += mg.srcBytes;
+        if (progress) progress(done, plan.workBytes);
+    }
+
+    {
+        std::set<std::string> files;
+        for (const auto &cp : plan.copies) files.insert(lower(cp.rel));
+        for (const auto &mg : plan.merges) files.insert(lower(mg.rel));
+        fixSizeTables(staging, files, id);
+    }
+
     // Human-readable manifest next to content/ (SDCafiine ignores it).
     {
         std::string manifest = "Built by PatchBay for " + c.gameName + " (" + c.titleId + ")\n\nPriority order:\n";
         for (size_t i = 0; i < c.members.size(); ++i)
             manifest += "  " + std::to_string(i + 1) + ". " + c.members[i] + "\n";
-        manifest += "\n" + std::to_string(plan.conflicts) + " overridden file(s)\n";
-        for (const auto &s : plan.conflictSamples) manifest += "  " + s + "\n";
+        manifest += "\n" + std::to_string(plan.shared) + " file(s) shipped by more than one mod, " +
+                    std::to_string(merged) + " merged without conflicts.\n";
+        if (plan.shared > 0)
+            manifest += usedBase ? "Merged against the game's original files.\n"
+                                 : "The game's original files were not available (needs Mocha and an installed\n"
+                                   "game), so only archive entries a single mod ships could be combined.\n";
+        manifest += "\n" + std::to_string(conflicts) +
+                    " conflict(s) where mods changed the same thing differently (higher priority wins):\n";
+        for (const auto &s : conflictSamples) manifest += "  " + s + "\n";
         FILE *f = std::fopen((staging + "/PATCHBAY_COMBO.txt").c_str(), "wb");
         if (f) {
             std::fwrite(manifest.data(), 1, manifest.size(), f);
@@ -748,9 +1019,11 @@ bool Installer::buildCombo(const std::string &id, const std::function<void(int64
     live.members = c.members;
     live.built = true;
     live.builtAt = (int64_t) std::time(nullptr);
-    live.sizeBytes = plan.totalBytes;
-    live.conflicts = plan.conflicts;
-    live.conflictSamples = plan.conflictSamples;
+    live.sizeBytes = sizeBytes;
+    live.merged = merged;
+    live.conflicts = conflicts;
+    live.usedBase = usedBase;
+    live.conflictSamples = conflictSamples;
     // Record the versions that were actually copied, so a member updated
     // mid-build still shows the combo as needing a rebuild.
     live.builtVersions.clear();
@@ -772,8 +1045,8 @@ bool Installer::buildCombo(const std::string &id, const std::function<void(int64
     lock.unlock();
 
     fs::removeAll(old);
-    fs::log("built combo %s: %d members, %d conflicts, %lld bytes", id.c_str(), (int) c.members.size(),
-            plan.conflicts, (long long) plan.totalBytes);
+    fs::log("built combo %s: %d members, %d shared files, %d merged, %d conflicts, base %s, %lld bytes", id.c_str(),
+            (int) c.members.size(), plan.shared, merged, conflicts, usedBase ? "yes" : "no", (long long) sizeBytes);
     return true;
 }
 

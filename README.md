@@ -21,8 +21,10 @@ PatchBay is written in C++17 with SDL2 and built with devkitPro/wut.
 - An SD card (FAT32) in the console.
 - An internet connection configured in System Settings.
 
-PatchBay does not need Mocha, a CFW-specific library or root filesystem access.
-It only uses the SD card and the network.
+PatchBay only needs the SD card and the network. If Mocha is running (it is
+part of Aroma), combos also read the game's original files from internal
+storage or USB to merge mods properly; without it, everything else works the
+same and combos fall back to file priority (see Combining mods).
 
 ## Install
 
@@ -232,10 +234,41 @@ mods for the same title into a single folder,
 - Files are copied, because FAT32 has no links. A combo needs extra SD space
   equal to its merged size. The member mods stay installed and are not
   modified.
-- Members are ordered by priority. When two members ship the same file (same
-  path, compared case-insensitively), the higher one wins. The conflict count
-  and sample paths are shown before building and written to
-  `PATCHBAY_COMBO.txt` in the combo folder, together with the priority order.
+- When two or more members ship the same file (same path, compared
+  case-insensitively), the copies are merged against the game's original file
+  so each mod keeps what it changed:
+  - A copy identical to the original changed nothing and is ignored. Mods
+    often ship a whole archive to change one entry; this keeps such a mod
+    from overwriting another mod's edits to the same archive.
+  - Yaz0-compressed files (`.szs` and others) are decompressed, merged and
+    recompressed.
+  - SARC archives (`.sarc`, `.pack`, `.bars`, the payload of most `.szs`) are
+    merged entry by entry, including archives nested inside archives.
+    Entries a mod adds are kept, and entries a mod removes are removed.
+  - RARC archives (`.arc`, used by Twilight Princess HD) with the same
+    folder layout are merged file by file.
+  - BMG message files (game text) are merged message by message.
+  - When two mods changed the same file, archive entry or message
+    differently, the member higher in the list wins. That is a conflict.
+- Twilight Princess HD's `content/FileSizeList.txt` and
+  `content/DecompressedSizeList.txt` list the size of every game file, and
+  every mod ships its own copy. A combo rewrites both from the files it
+  actually contains, so no mod's files are listed with the wrong size.
+- The original files are read from the installed game update, then the base
+  game (or the DLC for `aoc/`), on internal storage or USB. This needs Mocha
+  (included in Aroma). Without it, or for a disc-only game with no installed
+  update, every copy counts as changed. SARC archives are still combined, but
+  only entries a single mod ships survive and the rest is decided by
+  priority. The combo editor shows whether the original files were found.
+- Members are ordered by priority. The shared files are listed before
+  building. Conflicts, and whether the original files were used, are written
+  to `PATCHBAY_COMBO.txt` in the combo folder, together with the priority
+  order.
+- Shared files whose copies add up to more than 96 MiB are not merged (they
+  would not fit in memory); the highest-priority copy is used.
+- Other formats inside archives (BYML, MSBT, BFRES, and so on) are compared
+  as whole files, not merged field by field. RARC archives whose folder
+  layouts differ, and UTF-16 BMG files, are not merged.
 - Only `content/` and `aoc/` are merged. Other top-level files and folders
   (credits, readmes) are kept per mod under `_credits/<modId>/`.
 - Building a combo disables its enabled members so SDCafiine does not offer
@@ -317,9 +350,9 @@ Notes:
 - The SD card is FAT32, so no single file (including the downloaded ZIP) can be
   4 GiB or larger.
 - SDCafiine loads one modpack at a time per game. To use several mods
-  together, build a combo; it is a full copy and uses extra SD space. File
-  conflicts are resolved by priority only; files are never merged at the
-  content level.
+  together, build a combo; it is a full copy and uses extra SD space. Combos
+  merge Yaz0, SARC, RARC and BMG files; other formats are compared as whole files and
+  decided by priority when two mods change the same one.
 - Updates are only detected for mods installed by PatchBay (adopted mods have
   no known version).
 

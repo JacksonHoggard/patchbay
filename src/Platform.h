@@ -6,8 +6,8 @@
 //   - Aroma: as a .wuhb from the Wii U Menu, or as .rpx/.wuhb from the
 //     Homebrew Launcher.
 //   - Tiramisu: as a .rpx from the Homebrew Launcher.
-// It does not need Mocha or any root filesystem access; it only touches the
-// SD card through wut's "fs:" devoptab.
+// It only writes to the SD card, through wut's "fs:" devoptab. Mocha is
+// optional: combos use it to read original game files (see GameFiles.h).
 namespace platform {
 
 void init();

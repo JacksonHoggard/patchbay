@@ -1,5 +1,6 @@
 #include "App.h"
 #include "Fs.h"
+#include "GameFiles.h"
 #include "Http.h"
 #include "Paths.h"
 #include "Platform.h"
@@ -134,6 +135,7 @@ void App::shutdown() {
     images_.reset();
     http::globalCleanup();
     gfx_.shutdown();
+    gamefiles::shutdown();
     platform::shutdown();
 }
 
@@ -1621,14 +1623,17 @@ void App::updateComboPlan() {
     }
     comboPlanNeeded_ = false;
     planWorker_.reset(); // previous run already finished, joins at once
+    planProgress_.reset();
 
     std::string tid = comboEdit_.titleId;
     std::vector<std::string> members = comboEdit_.members;
     auto work = [this, gen, tid, members] {
-        ComboPlan p = installer_.planCombo(tid, members, &planCancel_);
-        int files = (int) p.copies.size();
+        ComboPlan p = installer_.planCombo(tid, members, &planCancel_, &planProgress_);
+        int files = (int) (p.copies.size() + p.merges.size());
         p.copies.clear();
         p.copies.shrink_to_fit();
+        p.merges.clear();
+        p.merges.shrink_to_fit();
         std::lock_guard<std::mutex> lock(planMutex_);
         planRunning_ = false;
         if (gen != planGen_) return;
@@ -1783,6 +1788,7 @@ void App::drawCombos() {
         gfx_.text(c.id, kMargin + 20, y + 6, FontSize::Normal, c.enabled ? color::Text : color::Dim, 640);
         std::string sub = c.gameName + "  |  " + c.titleId + "  |  " + std::to_string(c.members.size()) + " mods";
         if (c.built) sub += "  |  " + formatSize(c.sizeBytes);
+        if (c.built && c.conflicts > 0) sub += "  |  " + std::to_string(c.conflicts) + " conflicts";
         gfx_.text(sub, kMargin + 20, y + 36, FontSize::Small, color::Dim, 760);
 
         SDL_Color sc = color::Dim;
@@ -1869,15 +1875,30 @@ void App::drawComboEdit() {
     gfx_.text("Members: " + std::to_string(comboEdit_.members.size()), x, y, FontSize::Small, color::Text, w);
     y += 30;
     if (!ready) {
-        gfx_.text("Calculating...", x, y, FontSize::Small, color::Dim, w);
+        // The total file count is unknown until every member is walked, so
+        // show what has been scanned instead of a percentage.
+        int member = planProgress_.member, members = planProgress_.members, found = planProgress_.files;
+        std::string status;
+        if (planProgress_.checkingBase) status = "Looking for original game files...";
+        else if (member > 0) status = "Scanning mod " + std::to_string(member) + " of " + std::to_string(members) + "...";
+        else status = "Calculating...";
+        gfx_.text(status, x, y, FontSize::Small, color::Dim, w);
+        y += 30;
+        if (member > 0)
+            gfx_.text(std::to_string(found) + " files found", x, y, FontSize::Small, color::Dim, w);
         return;
     }
     gfx_.text("Total size: " + formatSize(plan.totalBytes) + "  (" + std::to_string(files) + " files)", x, y,
               FontSize::Small, color::Text, w);
     y += 30;
-    gfx_.text("Conflicts: " + std::to_string(plan.conflicts) + " files", x, y, FontSize::Small,
-              plan.conflicts > 0 ? color::Warn : color::Text, w);
+    gfx_.text("Shared files: " + std::to_string(plan.shared) + " (merged on build)", x, y, FontSize::Small,
+              color::Text, w);
     y += 30;
+    if (plan.shared > 0) {
+        gfx_.text(plan.baseAvailable ? "Original game files: found" : "Original game files: not available", x, y,
+                  FontSize::Small, plan.baseAvailable ? color::Good : color::Warn, w);
+        y += 30;
+    }
 
     const int lh = gfx_.lineHeight(FontSize::Small);
     const int bottom = py + ph - 16;
@@ -1888,12 +1909,17 @@ void App::drawComboEdit() {
         y += lh;
     }
 
-    auto note = gfx_.wrap("Higher in the list wins when two mods replace the same file.", FontSize::Small, w);
+    auto note = gfx_.wrap(plan.baseAvailable || plan.shared == 0
+                              ? "Shared files are merged so each mod keeps its changes. Higher in the list wins "
+                                "only where two mods changed the same thing."
+                              : "Without the original files (needs Mocha and the game installed), only archive "
+                                "entries one mod ships are combined; otherwise higher in the list wins.",
+                          FontSize::Small, w);
     int noteY = bottom - (int) note.size() * lh;
     y += 6;
-    for (size_t i = 0; i < plan.conflictSamples.size() && i < 12; ++i) {
+    for (size_t i = 0; i < plan.sharedSamples.size() && i < 12; ++i) {
         if (y + lh > noteY - 6) break;
-        gfx_.text(plan.conflictSamples[i], x, y, FontSize::Small, color::Dim, w);
+        gfx_.text(plan.sharedSamples[i], x, y, FontSize::Small, color::Dim, w);
         y += lh;
     }
     for (auto &l : note) {

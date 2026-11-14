@@ -21,8 +21,10 @@ struct FileInfo {
     int64_t size;
 };
 
-// Recursively lists every regular file under `root`.
-std::vector<FileInfo> walkFiles(const std::string &root);
+// Recursively lists every regular file under `root`. `onFile` is called once
+// per file found; a set `cancel` stops the walk early.
+std::vector<FileInfo> walkFiles(const std::string &root, const std::function<void()> &onFile = nullptr,
+                                const std::atomic<bool> *cancel = nullptr);
 
 // Copies one file. `onBytes` is called with the number of bytes just written.
 bool copyFile(const std::string &from, const std::string &to, const std::function<void(int64_t)> &onBytes,

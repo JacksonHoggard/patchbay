@@ -25,7 +25,9 @@ struct InstalledMod {
 // A combo merges several installed mods for one game into a single SDCafiine
 // modpack folder (sdcafiine/<TITLEID>/<id>/), because SDCafiine only loads
 // one modpack per game. Files are copied, so member mods stay untouched.
-// When two members ship the same file, the one earlier in `members` wins.
+// When two members ship the same file, the copies are merged against the
+// game's original file (see Merge.h). Only where two members changed the
+// same thing differently does the one earlier in `members` win.
 struct Combo {
     std::string id; // folder name, e.g. "PatchBayCombo-1"
     std::string titleId;
@@ -37,8 +39,10 @@ struct Combo {
     bool built = false;
     int64_t builtAt = 0;
     int64_t sizeBytes = 0;
-    int conflicts = 0;
-    std::vector<std::string> conflictSamples;      // "path: winner over loser"
+    int merged = 0;     // files several members ship, merged without a conflict
+    int conflicts = 0;  // places where priority decided (file or archive entry)
+    bool usedBase = false; // original game files were available for the merge
+    std::vector<std::string> conflictSamples;      // "path" or "archive/entry"
     std::map<std::string, std::string> builtVersions; // member id -> version used
     // Member enabled state before the combo disabled it, restored on delete.
     std::map<std::string, bool> restoreEnabled;
@@ -51,12 +55,36 @@ struct ComboPlan {
         std::string rel; // destination relative to the combo folder
         int64_t size;
     };
+    // A file several members ship; merged at build time.
+    struct Merge {
+        std::vector<std::string> srcs; // absolute, highest priority first
+        std::string rel;
+        int64_t srcBytes; // sum of the copies' sizes
+    };
     std::vector<Copy> copies;
-    int64_t totalBytes = 0;
-    int conflicts = 0;
-    std::vector<std::string> conflictSamples;
+    std::vector<Merge> merges;
+    int64_t totalBytes = 0; // estimated size of the combo
+    int64_t workBytes = 0;  // bytes a build reads (for progress)
+    int shared = 0;         // == merges.size(), kept when merges is cleared
+    bool baseAvailable = false; // original game files can be read (see GameFiles.h)
+    std::vector<std::string> sharedSamples; // "path: mod A + mod B"
     std::vector<std::string> missing; // members that are not installed
     std::map<std::string, std::string> versions; // member id -> version that was planned
+};
+
+// Live progress of planCombo, read by the UI thread while it runs.
+struct ComboPlanProgress {
+    std::atomic<int> member{0};  // 1-based member being scanned, 0 = not started
+    std::atomic<int> members{0};
+    std::atomic<int> files{0};   // files found so far, all members
+    std::atomic<bool> checkingBase{false};
+
+    void reset() {
+        member = 0;
+        members = 0;
+        files = 0;
+        checkingBase = false;
+    }
 };
 
 // Owns installed.json and everything under sd:/wiiu/sdcafiine that PatchBay
@@ -103,13 +131,15 @@ public:
     bool comboStale(const Combo &combo) const;
     std::vector<std::string> combosContaining(const std::string &modId) const;
 
-    // Works out which file wins for every path. Reads the SD card (walks
-    // every member folder), so call it off the render thread for big mods.
+    // Works out which files are copied as is and which several members ship
+    // (merged at build time). Reads the SD card (walks every member folder),
+    // so call it off the render thread for big mods.
     ComboPlan planCombo(const std::string &titleId, const std::vector<std::string> &members,
-                        const std::atomic<bool> *cancel = nullptr) const;
+                        const std::atomic<bool> *cancel = nullptr, ComboPlanProgress *progress = nullptr) const;
 
-    // Copies the members into a staging folder and swaps it in. Members that
-    // are enabled get disabled so SDCafiine does not offer them separately.
+    // Copies the members into a staging folder, merging files several of them
+    // ship, and swaps it in. Members that are enabled get disabled so
+    // SDCafiine does not offer them separately.
     bool buildCombo(const std::string &id, const std::function<void(int64_t, int64_t)> &progress,
                     const std::atomic<bool> *cancel, std::string &error);
     bool deleteCombo(const std::string &id, std::string &error);
